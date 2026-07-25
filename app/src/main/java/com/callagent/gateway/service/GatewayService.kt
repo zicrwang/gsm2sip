@@ -26,7 +26,9 @@ import com.callagent.gateway.bridge.CallOrchestrator
 import com.callagent.gateway.gsm.GsmCallManager
 import com.callagent.gateway.net.StunClient
 import com.callagent.gateway.sip.SipClient
+import java.net.DatagramSocket
 import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
@@ -123,7 +125,7 @@ class GatewayService : Service() {
             it != CallOrchestrator.BridgeState.IDLE
         } ?: false
         if (busy) return
-        val newIp = getLocalIp()
+        val newIp = getLocalIp(cfgServer, cfgPort)
         if (newIp == "0.0.0.0") return
         val ipChanged = newIp != currentLocalIp
         val notRegistered = sipClient?.registered != true
@@ -295,7 +297,7 @@ class GatewayService : Service() {
 
     /** Shared SIP init — called from both startGateway and reconnect threads. */
     private fun initSipClient() {
-        val localIp = getLocalIp()
+        val localIp = getLocalIp(cfgServer, cfgPort)
         currentLocalIp = localIp
         broadcastLog("Local IP: $localIp")
 
@@ -304,8 +306,13 @@ class GatewayService : Service() {
             Log.e(TAG, "STUN exception: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
-        val publicIp = stunResult?.publicIp ?: localIp
-        if (stunResult != null) {
+        // For a private SIP server, advertise the route-local address. A STUN
+        // result is a public/NAT address and is not reachable from the LAN.
+        val useLocalAddress = isPrivateIpv4(cfgServer) && isPrivateIpv4(localIp)
+        val publicIp = if (useLocalAddress) localIp else stunResult?.publicIp ?: localIp
+        if (useLocalAddress && stunResult != null) {
+            broadcastLog("Private SIP server, using local IP for SDP: $localIp")
+        } else if (stunResult != null) {
             broadcastLog("STUN public IP: ${stunResult.publicIp}:${stunResult.publicPort}")
         } else {
             broadcastLog("STUN failed, using local IP for SDP")
@@ -546,7 +553,23 @@ class GatewayService : Service() {
 
     // ── Network ─────────────────────────────────────────
 
-    private fun getLocalIp(): String {
+    /** Select the address used to reach the SIP server, not the first address on the phone. */
+    private fun getLocalIp(server: String, port: Int): String {
+        if (server.isNotBlank()) {
+            try {
+                DatagramSocket().use { socket ->
+                    socket.connect(InetSocketAddress(server, port))
+                    val address = socket.localAddress
+                    if (address is Inet4Address && !address.isLoopbackAddress) {
+                        return address.hostAddress ?: "0.0.0.0"
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to select route to $server:$port: ${e.message}")
+            }
+        }
+
+        // Fallback for startup or an unresolved server name.
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
@@ -564,6 +587,14 @@ class GatewayService : Service() {
             Log.e(TAG, "Failed to get local IP: ${e.message}")
         }
         return "0.0.0.0"
+    }
+
+    private fun isPrivateIpv4(value: String): Boolean {
+        val parts = value.split('.')
+        if (parts.size != 4 || parts.any { it.toIntOrNull() == null }) return false
+        val a = parts[0].toInt()
+        val b = parts[1].toInt()
+        return a == 10 || a == 127 || (a == 172 && b in 16..31) || (a == 192 && b == 168)
     }
 
     /**
