@@ -144,14 +144,19 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-b91041059e4d3ef136f5d4eaf008d79a22727f6efd90e97302832ef34da80493
+9fd1695e2b87f5fb89dd13f5615b73ddde971e33f6c8fc1131faad94966985e1
 
 gateway-magisk.zip
-88cdb65e0a6815d25159d657bc2fb5515100a7df74c41b062b5d4f04a4bb4283
+4f7520f2dbaa1f7b770c2adfb5f3664b8e8294ad215c8d0ae118ecd6f72f7b4f
 ```
 
-APK 版本应为 `2.8.57`（versionCode `335`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.58`（versionCode `336`），并通过 APK Signature Scheme
 v2 验证。
+
+v2.8.58 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+incall_music 数字注入，并在桥接期间静音物理 Voice RX endpoint；挂断后
+恢复 mixer。这样 RTP 仍可取得 modem 下行，而 MI8 听筒或扬声器不再承担
+桥接播放。
 
 ## 7. 仍需在设备端完成的事项
 

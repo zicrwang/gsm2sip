@@ -242,10 +242,16 @@ data class DeviceProfile(
          */
         fun sdm845Dipper() = DeviceProfile(
             name = "Xiaomi Mi 8 (SDM845/Tavil)",
-            mixerSetupCmd = "tinymix 'Voice Tx Mute' 0 2>/dev/null",
+            mixerSetupCmd = buildString {
+                // Mute the physical voice endpoint after the modem capture
+                // tap, while keeping the digital uplink injection open.
+                append("tinymix 'Voice Rx Device Mute' 1 2>/dev/null; ")
+                append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
+            },
             mixerRestoreCmd = buildString {
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
                 append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 0 2>/dev/null; ")
+                append("tinymix 'Voice Rx Device Mute' 0 2>/dev/null; ")
                 append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
             },
             mixerIncallMusicCmd = buildString {
@@ -269,7 +275,7 @@ data class DeviceProfile(
             incallMusicParam = "incall_music_enabled",
             voiceDownlinkWorks = true,
             preferTelephonyCapture = true,
-            voiceCallVolPercent = 15,
+            voiceCallVolPercent = 1,
             routeChangeDelayMs = 500,
             appopsPropagationMs = 300,
         )

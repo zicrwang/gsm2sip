@@ -90,6 +90,10 @@ MI8 上的实测映射为：SIM 1 对应 `subId=2`、PhoneAccount ID `2`
 v2.8.57 已验证选择 SIM 1 后 Telecom 直接进入 `DIALING`，不会再进入
 `SELECT_PHONE_ACCOUNT`。
 
+v2.8.58 在此基础上为 MI8 增加物理 Voice RX endpoint 静音，并保留
+VOICE_DOWNLINK/VOICE_CALL 数字捕获和 incall_music 数字注入；挂断后 mixer
+自动恢复。
+
 ## 4. 部署验收
 
 以下检查必须全部通过：

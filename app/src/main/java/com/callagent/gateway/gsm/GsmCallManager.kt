@@ -315,7 +315,7 @@ object GsmCallManager {
 
                     val tinymixStatus = if (DeviceProfile.tinymixBin.isNotEmpty()) "available" else "NOT FOUND"
                     val route = if (profile.requireSpeakerMode) "speaker" else "earpiece"
-                    appLog("Audio bridge: $route, mode=${am.mode}, tinymix=$tinymixStatus, profile=${profile.name}")
+                    appLog("Audio bridge: $route (physical Voice RX muted by profile), mode=${am.mode}, tinymix=$tinymixStatus, profile=${profile.name}")
                 }
             }
         } catch (e: Exception) {
