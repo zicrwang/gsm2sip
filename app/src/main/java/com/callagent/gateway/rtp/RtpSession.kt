@@ -38,7 +38,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   Samsung HAL may route this into the modem uplink directly.
  *
  * The Magisk module disables Android's audio concurrency restrictions.
- * Uses G.722 codec for wideband (16 kHz), falls back to PCMA (G.711 A-law).
+ * Uses PCMA (G.711 A-law) at 8 kHz.  This avoids negotiating a wideband
+ * codec that the device audio HAL advertises but cannot actually route.
  */
 class RtpSession(
     private val context: Context,
@@ -174,48 +175,17 @@ class RtpSession(
      * does NOT inject via incall_music — that's why SIP→GSM was silent.
      */
     private fun initAudio(): Boolean {
-        // Playback rate matches codec output rate.  G.722 decodes to 16 kHz.
-        playbackRate = when (payloadType) {
-            RtpPacket.PT_PCMA, RtpPacket.PT_PCMU -> 8000
-            else -> 16000  // G.722
-        }
+        // PCMA is the only negotiated codec, so both directions stay at 8 kHz.
+        playbackRate = 8000
 
-        // Try telephony capture sources, then mic sources.
-        // When using G.722 (wideband), prefer 16kHz capture to avoid upsampling
-        // artifacts.  HD Voice (AMR-WB/EVS) provides native 16kHz audio.
+        // Do not request VOICE_CALL/VOICE_DOWNLINK here.  On the affected
+        // emulator those sources can initialize while returning silence and
+        // trigger unsupported mixer controls.  Use ordinary AudioRecord
+        // inputs that the HAL actually implements.
         val configs = mutableListOf<SourceConfig>()
-
-        val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
-
-        // VOICE_CALL (source 4): captures uplink+downlink mixed digitally.
-        // Best option on MSM8930 — if it initializes, it provides clean
-        // digital capture of the caller's voice.  Requires CAPTURE_AUDIO_OUTPUT.
-        if (wideband) {
-            // G.722: prefer 16kHz native capture — avoids upsampling artifacts
-            // in the 4-8kHz upper band that cause AI agent false interruptions.
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        }
-        // Mic-based sources: in speaker mode, the physical mic picks up the
-        // caller's voice from the speaker.  This is acoustic coupling — not
-        // ideal but functional when digital capture sources fail.
-        // VOICE_RECOGNITION bypasses noise suppression that can mute call audio.
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
         configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
-        // VOICE_DOWNLINK (source 3): DEAD LAST — on MSM8930 it initializes
-        // successfully (STATE_INITIALIZED) but captures SILENCE because the
-        // Incall_Rec mixer controls don't exist on this SoC.  If it were
-        // earlier in the list, it would "win" over mic-based sources that
-        // actually work.  Kept only for devices where it genuinely works.
-        if (wideband) {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
 
         var record: AudioRecord? = null
         var usedSource = "none"
@@ -375,7 +345,7 @@ class RtpSession(
         // as silent.  This handles both cold-boot AudioRecord unavailability
         // AND sources that initialize but deliver no audio (e.g., VOICE_CALL
         // on Exynos 9820 where the HAL doesn't route voice data to capture).
-        val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
+        val wideband = false
         val defaultRemoteInet = InetAddress.getByName(remoteAddr)
         val maxFallbacks = 5  // Maximum silent-source fallback cycles
 
@@ -469,21 +439,12 @@ class RtpSession(
      *  sources already detected as silent. */
     private fun buildCaptureConfigs(wideband: Boolean): List<SourceConfig> {
         val configs = mutableListOf<SourceConfig>()
-        if (wideband) {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        }
+        // Keep this list aligned with initAudio(): telephony capture sources
+        // are deliberately excluded because unsupported HAL controls can
+        // produce a valid AudioRecord that contains only silence.
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
         configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
-        if (wideband) {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
         return configs.filterNot { it.source in silentSourceIds }
     }
 
@@ -803,7 +764,9 @@ class RtpSession(
                     firstRxInfo = "pt=${rtp.payloadType} len=${rtp.payload.size} hex=$hexHead"
                     Log.i(TAG, "First RX: $firstRxInfo")
                 }
-                if (rtp.payloadType == payloadType || rtp.payloadType == RtpPacket.PT_PCMA || rtp.payloadType == RtpPacket.PT_G722) {
+                // The SIP offer/answer is PCMA-only.  Ignore stray wideband
+                // packets instead of decoding them as 8 kHz A-law audio.
+                if (rtp.payloadType == RtpPacket.PT_PCMA) {
                     if (!jitterBuffer.offer(rtp.payload)) {
                         jitterBuffer.poll() // drop oldest
                         jitterBuffer.offer(rtp.payload)

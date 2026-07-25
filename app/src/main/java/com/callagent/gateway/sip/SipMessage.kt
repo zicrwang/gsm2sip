@@ -116,9 +116,10 @@ class SipMessage private constructor(
 
     /** Get the preferred payload type from the remote SDP.
      *  Collects all payload types offered in the remote m=audio line,
-     *  then picks OUR preferred codec: PCMA > PCMU > G.722.
-     *  G.711 preferred for compatibility; G.722 used as fallback when
-     *  the remote only offers wideband. */
+     *  then picks the only codec supported by the gateway audio path.
+     *  PCMA is intentional: the Android audio bridge is fixed at 8 kHz
+     *  and some device HALs advertise wideband codecs they cannot route.
+     */
     val sdpPreferredPayloadType: Int
         get() {
             val mLine = body.lineSequence().firstOrNull {
@@ -130,12 +131,11 @@ class SipMessage private constructor(
             for (i in 3 until parts.size) {
                 parts[i].trim().toIntOrNull()?.let { offered.add(it) }
             }
-            // PCMA preferred for compatibility; G.722 as wideband fallback
+            // Do not fall back to G.722.  A negotiated codec must match the
+            // actual Android audio path, not just the remote offer.
             return when {
                 8 in offered -> 8   // PCMA (G.711 A-law, 8 kHz)
-                0 in offered -> 0   // PCMU (G.711 μ-law, 8 kHz)
-                9 in offered -> 9   // G.722 (wideband, 16 kHz)
-                else -> 8
+                else -> -1
             }
         }
 
@@ -368,16 +368,16 @@ object SipBuilder {
         }
 
     private fun buildSdp(localIp: String, rtpPort: Int): String = buildString {
-        // Offer PCMA preferred, G.722 as wideband fallback.
-        // G.722 clock rate in SDP is 8000 per RFC 3551 (historical quirk).
+        // The gateway deliberately offers PCMA only.  Keeping G.722 in the
+        // offer lets Asterisk select a codec that the Android HAL cannot
+        // actually capture or play, resulting in an immediate BYE/silence.
         append("v=0\r\n")
         append("o=gateway 0 0 IN IP4 $localIp\r\n")
         append("s=SIP Call\r\n")
         append("c=IN IP4 $localIp\r\n")
         append("t=0 0\r\n")
-        append("m=audio $rtpPort RTP/AVP 8 9 101\r\n")
+        append("m=audio $rtpPort RTP/AVP 8 101\r\n")
         append("a=rtpmap:8 PCMA/8000\r\n")
-        append("a=rtpmap:9 G722/8000\r\n")
         append("a=rtpmap:101 telephone-event/8000\r\n")
         append("a=fmtp:101 0-16\r\n")
         append("a=ptime:20\r\n")

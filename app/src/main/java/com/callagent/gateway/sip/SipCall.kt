@@ -83,6 +83,12 @@ class SipCall(
                 msg.sdpRtpPort?.let { remoteRtpPort = it }
                 msg.sdpAddress?.let { remoteRtpAddress = it }
                 negotiatedPayloadType = msg.sdpPreferredPayloadType
+                if (negotiatedPayloadType < 0) {
+                    Log.e(TAG, "200 OK has no supported PCMA codec: ${msg.sdpCodecs}")
+                    state = State.TERMINATED
+                    listener?.onCallTerminated(this)
+                    return true
+                }
 
                 // ACK must use the same CSeq as the INVITE being acknowledged
                 val ackCseq = msg.cseq?.split(" ")?.firstOrNull()?.toIntOrNull() ?: localCseq

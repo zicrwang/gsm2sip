@@ -17,7 +17,7 @@ Audio flows through shared speaker/mic — both GSM and SIP audio run concurrent
 
 ## Audio Codec
 
-G.722 wideband (16 kHz, 64 kbps) for high quality voice. Falls back to G.711 A-law if needed.
+PCMA (G.711 A-law, 8 kHz) for compatibility with Android audio HALs and Asterisk.
 
 ## Requirements
 
@@ -65,6 +65,9 @@ be exposed directly to the Internet.
 The standalone `gateway.apk` can be used for a quick Web Debug Page test, but
 normal telephony use should install only `gateway-magisk.zip`, because the module
 already contains the APK and supplies the required privileged audio permissions.
+
+详细的三端部署、测试顺序、日志判断和 Asterisk 配置请参阅
+[docs/DEPLOYMENT-AND-TROUBLESHOOTING.md](docs/DEPLOYMENT-AND-TROUBLESHOOTING.md)。
 
 ## Asterisk Configuration
 
