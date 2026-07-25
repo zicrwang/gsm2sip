@@ -105,6 +105,11 @@ object GsmCallManager {
     }
 
     fun onCallStateChanged(call: Call, state: Int) {
+        if (activeCall === call && activeCallState == state) {
+            // onCallAdded already delivered this initial state. Android may
+            // immediately repeat it through the callback.
+            return
+        }
         activeCallState = state
 
         when (state) {
@@ -159,11 +164,31 @@ object GsmCallManager {
     }
 
     /** Place outgoing GSM call via the SIM */
-    fun makeCall(context: Context, destination: String) {
+    fun makeCall(context: Context, destination: String): Boolean {
         Log.i(TAG, "Making GSM call to $destination")
+        if (android.os.Build.VERSION.SDK_INT >= 23 &&
+            context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            appLog("GSM dial blocked: CALL_PHONE permission is not granted")
+            return false
+        }
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+        if (telecom?.defaultDialerPackage != context.packageName) {
+            appLog("GSM dial blocked: CallAgent is not the default phone app")
+            return false
+        }
         val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$destination"))
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
+        return try {
+            context.startActivity(intent)
+            true
+        } catch (e: SecurityException) {
+            appLog("GSM ACTION_CALL permission failure: ${e.message}")
+            false
+        } catch (e: Exception) {
+            appLog("GSM ACTION_CALL launch failure: ${e.message}")
+            false
+        }
     }
 
     /** Music volume percent — from device profile. */

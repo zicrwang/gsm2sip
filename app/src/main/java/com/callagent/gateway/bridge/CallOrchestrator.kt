@@ -43,6 +43,7 @@ class CallOrchestrator(
     private var activeRtpSession: RtpSession? = null
     private var activeSipCall: SipCall? = null
     private var activeGsmCall: Call? = null
+    @Volatile private var gsmActiveHandled = false
     @Volatile private var diallerInitiated = false
     @Volatile private var lastStateChangeTime = 0L
 
@@ -111,21 +112,16 @@ class CallOrchestrator(
         }
         Log.i(TAG, "Dialler-initiated call to $number")
         diallerInitiated = true
+        gsmActiveHandled = false
         lastStateChangeTime = System.currentTimeMillis()
         bridgeState = BridgeState.GSM_DIALING
         listener?.onStateChanged(bridgeState, "Dialing $number")
-        GsmCallManager.makeCall(context, number)
+        if (!GsmCallManager.makeCall(context, number)) {
+            tearDown("GSM dial unavailable")
+            return
+        }
 
-        // Timeout: if GSM doesn't go active within 45s, tear down.
-        // On cold boot, InCallService may not be bound, so call events
-        // never arrive and the bridge gets stuck in GSM_DIALING.
-        Thread({
-            Thread.sleep(GSM_DIAL_TIMEOUT_MS)
-            if (bridgeState == BridgeState.GSM_DIALING) {
-                Log.w(TAG, "GSM dial timeout — no call events in ${GSM_DIAL_TIMEOUT_MS / 1000}s")
-                tearDown("GSM dial timeout")
-            }
-        }, "GSM-Dial-Timeout").start()
+        startGsmDialTimeout()
     }
 
     // ── SipClient.Listener ──────────────────────────────
@@ -150,8 +146,14 @@ class CallOrchestrator(
             return
         }
 
-        val gsmDest = call.gsmForwardNumber
+        val gsmDest = call.gsmForwardNumber?.let(::normalizeGsmNumber)
         if (gsmDest != null) {
+            if (gsmDest.isEmpty()) {
+                Log.e(TAG, "Invalid X-GSM-Forward value: '${call.gsmForwardNumber}'")
+                call.hangup()
+                return
+            }
+            Log.i(TAG, "Recognized GSM outbound target: $gsmDest")
             // OUTBOUND flow: Asterisk wants us to dial a GSM number
             handleOutboundFlow(call, gsmDest)
         } else {
@@ -197,6 +199,11 @@ class CallOrchestrator(
     override fun onIncomingGsmCall(call: Call, number: String) {
         Log.i(TAG, "Incoming GSM call from $number")
 
+        if (activeGsmCall === call && bridgeState == BridgeState.GSM_RINGING) {
+            Log.d(TAG, "Ignoring duplicate GSM ringing callback")
+            return
+        }
+
         if (bridgeState != BridgeState.IDLE) {
             Log.w(TAG, "Busy — rejecting GSM call")
             GsmCallManager.rejectCall(call)
@@ -204,6 +211,7 @@ class CallOrchestrator(
         }
 
         sipCallRetries = 0
+        gsmActiveHandled = false
         bridgeState = BridgeState.GSM_RINGING
         activeGsmCall = call
         listener?.onStateChanged(bridgeState, "GSM call from $number")
@@ -219,6 +227,11 @@ class CallOrchestrator(
     /** GSM call is now active (answered) */
     override fun onGsmCallActive(call: Call) {
         Log.i(TAG, "GSM call active")
+        if (gsmActiveHandled && activeGsmCall === call) {
+            Log.d(TAG, "Ignoring duplicate GSM active callback")
+            return
+        }
+        gsmActiveHandled = true
         activeGsmCall = call
 
         when (bridgeState) {
@@ -422,6 +435,7 @@ class CallOrchestrator(
 
         bridgeState = BridgeState.GSM_DIALING
         activeSipCall = sipCall
+        gsmActiveHandled = false
         listener?.onStateChanged(bridgeState, "Dialing $gsmDestination")
 
         // Send 180 Ringing to SIP caller while GSM dials
@@ -430,8 +444,23 @@ class CallOrchestrator(
             sipClient.sendTo(ringing, sipCall.remoteContactAddress ?: sipClient.serverAddress)
         }
 
-        // Dial via GSM SIM
-        GsmCallManager.makeCall(context, gsmDestination)
+        // Dial via GSM SIM.  Surface failures immediately; otherwise the SIP
+        // leg remains ringing while the bridge is stuck in GSM_DIALING.
+        try {
+            if (!GsmCallManager.makeCall(context, gsmDestination)) {
+                tearDown("GSM dial unavailable")
+                return
+            }
+            Log.i(TAG, "GSM ACTION_CALL started for $gsmDestination")
+        } catch (e: Exception) {
+            Log.e(TAG, "GSM ACTION_CALL failed for $gsmDestination: ${e.message}", e)
+            tearDown("GSM dial failed")
+        }
+
+        // Do not leave Asterisk ringing forever when Android never delivers
+        // InCallService callbacks (missing default-dialer role, permission,
+        // or a modem failure).
+        startGsmDialTimeout()
     }
 
     // ── RTP ─────────────────────────────────────────────
@@ -467,8 +496,12 @@ class CallOrchestrator(
                 listener?.onRtpStats(stats)
             }
         }
-        session.start()
         activeRtpSession = session
+        session.start()
+        if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) {
+            session.stop()
+            if (activeRtpSession === session) activeRtpSession = null
+        }
     }
 
     // ── Teardown ────────────────────────────────────────
@@ -478,6 +511,7 @@ class CallOrchestrator(
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
         bridgeState = BridgeState.TEARING_DOWN
         diallerInitiated = false
+        gsmActiveHandled = false
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
@@ -507,6 +541,9 @@ class CallOrchestrator(
             }
             activeGsmCall = null
             pendingRtpAddr = null
+            pendingRtpPort = 0
+            pendingPayloadType = 0
+            pendingLocalRtpPort = 0
         } finally {
             bridgeState = BridgeState.IDLE
             lastStateChangeTime = System.currentTimeMillis()
@@ -531,6 +568,34 @@ class CallOrchestrator(
             }
         }
         throw RuntimeException("No free RTP port available")
+    }
+
+    private fun normalizeGsmNumber(raw: String): String {
+        var value = raw.trim().trim('"', '\'')
+        val bracketed = Regex("<([^>]+)>").find(value)?.groupValues?.getOrNull(1)
+        if (bracketed != null) value = bracketed
+        value = value.substringBefore(';').substringBefore(',').trim()
+        value = value.removePrefix("tel:").removePrefix("TEL:")
+            .removePrefix("sip:").removePrefix("SIP:")
+            .substringBefore('@')
+        val compact = value.filterNot { it == ' ' || it == '-' || it == '(' || it == ')' || it == '.' }
+        if (compact.isEmpty() || compact.any { !it.isDigit() && it != '+' && it != '*' && it != '#' }) {
+            return ""
+        }
+        val prefix = if (compact.startsWith("+")) "+" else ""
+        val body = compact.removePrefix("+")
+        if (body.isEmpty() || body.any { !it.isDigit() && it != '*' && it != '#' }) return ""
+        return prefix + body
+    }
+
+    private fun startGsmDialTimeout() {
+        Thread({
+            try { Thread.sleep(GSM_DIAL_TIMEOUT_MS) } catch (_: InterruptedException) { return@Thread }
+            if (bridgeState == BridgeState.GSM_DIALING) {
+                Log.w(TAG, "GSM dial timeout — no ACTIVE callback in ${GSM_DIAL_TIMEOUT_MS / 1000}s")
+                tearDown("GSM dial timeout")
+            }
+        }, "GSM-Dial-Timeout").start()
     }
 
     /**
@@ -604,7 +669,11 @@ class CallOrchestrator(
             activeGsmCall?.disconnect()
         } catch (_: Exception) {}
         activeGsmCall = null
+        gsmActiveHandled = false
         pendingRtpAddr = null
+        pendingRtpPort = 0
+        pendingPayloadType = 0
+        pendingLocalRtpPort = 0
         diallerInitiated = false
         bridgeState = BridgeState.IDLE
         lastStateChangeTime = System.currentTimeMillis()

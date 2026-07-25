@@ -299,6 +299,7 @@ class GatewayService : Service() {
     private fun initSipClient() {
         val localIp = getLocalIp(cfgServer, cfgPort)
         currentLocalIp = localIp
+        selectedLocalIp = localIp
         broadcastLog("Local IP: $localIp")
 
         // STUN: discover public IP for NAT traversal
@@ -335,6 +336,7 @@ class GatewayService : Service() {
         orch.listener = object : CallOrchestrator.OrchestratorListener {
             override fun onStateChanged(state: CallOrchestrator.BridgeState, info: String) {
                 Log.i(TAG, "Bridge: $state - $info")
+                broadcastLog("BRIDGE: $state - $info")
                 val registered = sip.registered
 
                 // Track online time
@@ -699,6 +701,7 @@ class GatewayService : Service() {
         @Volatile var webPort: Int = 5060
         @Volatile var webUser: String = ""
         @Volatile var webOnlineSince: Long = 0L
+        @Volatile private var selectedLocalIp: String = ""
 
         fun logWeb(msg: String) = synchronized(webLogBuffer) {
             webLogBuffer.add(msg)
@@ -708,6 +711,7 @@ class GatewayService : Service() {
         fun webLogSnapshot(): List<String> = synchronized(webLogBuffer) { webLogBuffer.toList() }
 
         fun localIp(): String {
+            if (selectedLocalIp.isNotBlank()) return selectedLocalIp
             try {
             val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
