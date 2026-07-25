@@ -109,7 +109,7 @@ build_apk() {
 
     if [ "$BUILD_TYPE" = "release" ]; then
         ./gradlew assembleRelease --no-daemon
-        APK_PATH="app/build/outputs/apk/release/app-release-unsigned.apk"
+        APK_PATH="app/build/outputs/apk/release/app-release.apk"
     else
         ./gradlew assembleDebug --no-daemon
         APK_PATH="app/build/outputs/apk/debug/app-debug.apk"

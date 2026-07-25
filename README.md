@@ -13,7 +13,11 @@ A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gate
 - **Inbound**: Someone calls the local number → phone auto-answers → bridges to Asterisk via SIP → AI agent handles the call
 - **Outbound**: Asterisk sends SIP INVITE with `X-GSM-Forward: +<number>` header → phone dials the destination via GSM SIM → bridges audio back to SIP
 
-Audio flows through shared speaker/mic — both GSM and SIP audio run concurrently on the same hardware, enabled by a Magisk module that disables Android's audio concurrency restrictions.
+Audio uses a device-specific bridge. On supported phones such as Xiaomi Mi 8,
+privileged telephony capture and `incall_music` mixer controls provide the
+digital path; other profiles can fall back to speaker/microphone routing. The
+root module supplies the privileged permissions, audio tools, and concurrency
+properties required by the bridge.
 
 ## Audio Codec
 
@@ -21,7 +25,8 @@ PCMA (G.711 A-law, 8 kHz) for compatibility with Android audio HALs and Asterisk
 
 ## Requirements
 
-- **Device**: Samsung Galaxy S10e (or similar) with LineageOS + Magisk root
+- **Device**: Xiaomi Mi 8 (`dipper`, SDM845/Tavil) or Samsung Galaxy S10e with LineageOS + Magisk-compatible root
+- **SukiSU Ultra v4.0.0**: use its built-in Magic Mount directly. Do not install `meta-overlayfs`; v4.0.0 predates SukiSU's metamodule integration.
 - **SIM**: SIM card with voice plan
 - **Network**: Stable WiFi connection
 - **Power**: Always connected to charger
@@ -42,11 +47,15 @@ Outputs:
 
 Only the Magisk module needs to be installed — it includes the APK and handles all permissions automatically.
 
-1. **Install Magisk module**: Copy `gateway-magisk.zip` to device, install via Magisk Manager → Modules
+1. **Install root module**: Copy `gateway-magisk.zip` to the device and install it through Magisk, KernelSU, or SukiSU Manager
 2. **Reboot** the device — the module installs the APK as a privileged system app and grants all permissions on boot
 3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → SIP-GSM Gateway
-4. **Configure SIP**: Enter your Asterisk server address, port, username, and password
+4. **Configure SIP and SIM**: Enter your Asterisk server details and select a fixed outgoing GSM SIM
 5. **Start**: Tap START — the app registers with Asterisk and begins bridging calls
+
+On dual-SIM devices, Gateway passes the selected SIM's `PhoneAccountHandle`
+directly to Android Telecom. This avoids the system `SELECT_PHONE_ACCOUNT`
+prompt, which would otherwise block unattended SIP-to-GSM calls.
 
 ### Web Debug Page
 
@@ -68,6 +77,9 @@ already contains the APK and supplies the required privileged audio permissions.
 
 详细的三端部署、测试顺序、日志判断和 Asterisk 配置请参阅
 [docs/DEPLOYMENT-AND-TROUBLESHOOTING.md](docs/DEPLOYMENT-AND-TROUBLESHOOTING.md)。
+
+Xiaomi MI8 与 SukiSU Ultra v4.0.0 的挂载架构、安装验收和启动循环恢复请参阅
+[docs/SUKISU-ULTRA-V4-MI8.md](docs/SUKISU-ULTRA-V4-MI8.md)。
 
 ## Asterisk Configuration
 
@@ -150,7 +162,7 @@ same => n,Hangup()
                                  └───────────────────┘
 ```
 
-## Magisk Module
+## Root Module
 
 The `gateway-magisk.zip` module does two critical things:
 

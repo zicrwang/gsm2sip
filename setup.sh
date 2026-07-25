@@ -35,8 +35,19 @@ install_system_packages() {
 
     apt-get update -qq
 
+    # Debian 13 no longer ships OpenJDK 17.  Prefer 17 where available,
+    # otherwise use a newer supported JDK (the Android build requires 17+).
+    local jdk_package="openjdk-17-jdk"
+    if ! apt-cache show "$jdk_package" >/dev/null 2>&1; then
+        if apt-cache show openjdk-21-jdk >/dev/null 2>&1; then
+            jdk_package="openjdk-21-jdk"
+        else
+            jdk_package="default-jdk"
+        fi
+    fi
+
     apt-get install -y -qq \
-        openjdk-17-jdk \
+        "$jdk_package" \
         curl \
         unzip \
         zip \
@@ -50,7 +61,7 @@ install_system_packages() {
     if [ "$JAVA_VER" -lt 17 ] 2>/dev/null; then
         err "JDK 17+ required but got version $JAVA_VER"
     fi
-    log "JDK 17 installed"
+    log "JDK 17+ installed ($jdk_package)"
 }
 
 # ── 2. Android SDK command-line tools ────────────────

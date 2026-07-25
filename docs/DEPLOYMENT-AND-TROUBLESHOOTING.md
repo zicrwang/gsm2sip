@@ -46,11 +46,12 @@ WPhone 账号也必须使用实际配置的用户名和密码。若 Asterisk 日
 正常使用只安装 `gateway-magisk.zip`，因为模块已经包含 APK、特权权限和音频工具。
 
 1. 将 `gateway-magisk.zip` 复制到手机。
-2. 在 Sukisu Ultra 的模块页面安装。
+2. 在 SukiSU Ultra 的模块页面安装。
 3. 重启手机。
 4. 将 Gateway 设置为默认电话应用。
 5. 授予电话、通话记录和录音权限。
-6. 在应用中填写 Asterisk 地址、端口、用户名和密码，点击启动。
+6. 在应用中填写 Asterisk 地址、端口、用户名和密码，并选择固定的
+   `Outgoing GSM SIM`，然后点击启动。
 7. 打开 `http://192.168.188.2:8787/` 查看调试页。
 
 不要同时安装独立 APK。独立 `gateway.apk` 只适合快速验证界面；通话桥接需要 Magisk 模块提供的特权权限。
@@ -75,6 +76,7 @@ asterisk -rx "sip set debug peer mi8"
 ```text
 BRIDGE: GSM_DIALING
 GSM ACTION_CALL started
+GSM dialing via SIM1 PhoneAccount=2
 GSM state: DIALING
 GSM state: ACTIVE
 RTP ready ... codec=PCMA
@@ -104,6 +106,11 @@ GSM ACTION_CALL launch failure
 GSM dial timeout
 ```
 
+双卡设备若停在 `SELECT_PHONE_ACCOUNT`，说明拨号没有携带明确的
+`PhoneAccountHandle`。v2.8.57 起应在 SIP Configuration 中选择固定卡槽，
+并在日志中确认 `GSM dialing via SIM<n> PhoneAccount=<id>`；MI8 实测 SIM1
+对应 PhoneAccount ID `2`，SIM2 对应 ID `1`。
+
 ### SIP 已接通后立即 BYE
 
 重点检查三项：
@@ -112,7 +119,10 @@ GSM dial timeout
 - SDP 是否只协商 `PCMA/8000`。
 - CallAgent 是否记录 `AudioRecord OK`、`AudioTrack` 启动和 RTP 收发计数增长。
 
-当前版本不再使用 `VOICE_CALL` 或 `VOICE_DOWNLINK` 音频源；若日志仍显示它们，说明手机上运行的不是最新模块，需卸载旧模块、重启后重新安装。
+音频源由设备配置决定。Xiaomi MI8 (`dipper`) 会优先尝试 `VOICE_DOWNLINK`
+和 `VOICE_CALL`，再回退到普通麦克风源；未验证数字通话路径的设备仍优先使用
+普通音频输入。若实际顺序与设备配置不符，应先核对 APK 版本和 `DeviceProfile`
+日志。
 
 ### `RTP ready` 但无声音
 
@@ -134,11 +144,14 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-285584e167283d130faa9eb2e76e2593e9404af7f885a0a2e888a8960bd041bd
+b91041059e4d3ef136f5d4eaf008d79a22727f6efd90e97302832ef34da80493
 
 gateway-magisk.zip
-152764b722f7341a5654cee5d61664a26b1aac49db275b19e18cab9f2b9d58d2
+88cdb65e0a6815d25159d657bc2fb5515100a7df74c41b062b5d4f04a4bb4283
 ```
+
+APK 版本应为 `2.8.57`（versionCode `335`），并通过 APK Signature Scheme
+v2 验证。
 
 ## 7. 仍需在设备端完成的事项
 

@@ -43,6 +43,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -452,12 +453,14 @@ class MainActivity : AppCompatActivity() {
         val etPort = view.findViewById<EditText>(R.id.etSipPort)
         val etUser = view.findViewById<EditText>(R.id.etSipUser)
         val etPassword = view.findViewById<EditText>(R.id.etSipPassword)
+        val spOutgoingSim = view.findViewById<Spinner>(R.id.spOutgoingSim)
         val cbAutoconnect = view.findViewById<CheckBox>(R.id.cbAutoconnect)
 
         etServer.setText(prefs.getString("server", "sip.callagent.pro"))
         etPort.setText(prefs.getInt("port", 5060).toString())
         etUser.setText(prefs.getString("user", ""))
         etPassword.setText(prefs.getString("pass", ""))
+        spOutgoingSim.setSelection(prefs.getInt("outgoing_sim_slot", 0).coerceIn(0, 1))
         cbAutoconnect.isChecked = prefs.getBoolean("autoconnect", true)
 
         AlertDialog.Builder(this)
@@ -473,9 +476,10 @@ class MainActivity : AppCompatActivity() {
                     .putInt("port", port)
                     .putString("user", user)
                     .putString("pass", pass)
+                    .putInt("outgoing_sim_slot", spOutgoingSim.selectedItemPosition)
                     .putBoolean("autoconnect", cbAutoconnect.isChecked)
                     .apply()
-                appendLog("Config saved: $user@$server:$port (autoconnect=${cbAutoconnect.isChecked})")
+                appendLog("Config saved: $user@$server:$port (SIM${spOutgoingSim.selectedItemPosition + 1}, autoconnect=${cbAutoconnect.isChecked})")
             }
             .setNegativeButton("Cancel", null)
             .show()

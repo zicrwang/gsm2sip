@@ -69,6 +69,10 @@ data class DeviceProfile(
     /** Whether VOICE_DOWNLINK returns real audio on this device. */
     val voiceDownlinkWorks: Boolean,
 
+    /** Whether privileged telephony AudioRecord sources should be tried
+     *  before acoustic microphone fallbacks. */
+    val preferTelephonyCapture: Boolean = false,
+
     /** Voice call stream volume as percentage of max (0=minimum non-zero).
      *  Controls the caller's voice volume on the speaker.
      *  MSM8930: 0 (muted via tinymix muteVoiceRx).
@@ -150,22 +154,15 @@ data class DeviceProfile(
          * Dump available ALSA mixer controls for diagnostics.
          * Called once on first audio bridge setup.  Returns the dump for logging.
          */
-        fun discoverMixerControls(): String {
+        fun discoverMixerControls(profile: DeviceProfile): String {
             return try {
                 val sb = StringBuilder()
                 val bin = tinymixBin
                 if (bin.isNotEmpty()) {
-                    // Compact discovery: NSRC/bridge state + ALSA cards only.
-                    // Full routing map established in v2.8.42 — no need for
-                    // bulk control dumps, enum lists, or mixer_paths.xml parsing.
+                    val diag = resolveCmd(profile.mixerDiagGrep)
                     val result = RootShell.execForOutput(
                         "echo '=== ALSA cards ==='; cat /proc/asound/cards 2>/dev/null; " +
-                        "echo '=== NSRC/Bridge state ==='; " +
-                        "for i in 0 1 2 3 4; do " +
-                        "  echo -n \"NSRC\${i}=\"; $bin \"ABOX NSRC\${i}\" 2>/dev/null || echo 'N/A'; " +
-                        "  echo -n \"NSRC\${i}_Bridge=\"; $bin \"ABOX NSRC\${i} Bridge\" 2>/dev/null || echo 'N/A'; " +
-                        "done; " +
-                        "echo -n 'SoundType='; $bin 'ABOX Sound Type' 2>/dev/null || echo 'N/A'; " +
+                        "echo '=== ${profile.name} mixer state ==='; $diag; " +
                         "echo '=== total controls ==='; $bin 2>&1 | wc -l",
                         timeoutMs = 8000
                     )
@@ -201,9 +198,14 @@ data class DeviceProfile(
             val hw = Build.HARDWARE.lowercase()
             val board = Build.BOARD.lowercase()
             val model = Build.MODEL.lowercase()
+            val device = Build.DEVICE.lowercase()
             Log.i(TAG, "Detecting device: hw=$hw board=$board model=${Build.MODEL} device=${Build.DEVICE}")
 
             return when {
+                // Xiaomi Mi 8 (SDM845 / WCD9340 Tavil)
+                device == "dipper" || board == "sdm845" && model == "mi 8" ->
+                    sdm845Dipper()
+
                 // Samsung Galaxy S4 Mini (MSM8930 / WCD9304)
                 board.contains("msm8930") || hw.contains("qcom") && model.contains("gt-i919") ->
                     msm8930()
@@ -228,6 +230,49 @@ data class DeviceProfile(
         }
 
         // ── Known device profiles ──
+
+        /** Xiaomi Mi 8 (SDM845 / WCD9340 Tavil codec)
+         *
+         *  LineageOS exposes separate VoiceMMode1/2 call paths and matching
+         *  Incall_Music/Incall_Music_2 controls for the two SIM slots.  Enable
+         *  both controls so the bridge follows whichever subscription Telecom
+         *  selected for the active call.  The audio policy also exposes
+         *  VOICE_CALL recording through VOC_REC_UL/DL, so privileged digital
+         *  capture is preferred over the speaker/microphone fallback.
+         */
+        fun sdm845Dipper() = DeviceProfile(
+            name = "Xiaomi Mi 8 (SDM845/Tavil)",
+            mixerSetupCmd = "tinymix 'Voice Tx Mute' 0 2>/dev/null",
+            mixerRestoreCmd = buildString {
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
+                append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 0 2>/dev/null; ")
+                append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
+            },
+            mixerIncallMusicCmd = buildString {
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
+                append("echo -n 'SIM1_INCALL='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>/dev/null; ")
+                append("echo -n 'SIM2_INCALL='; tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 2>/dev/null")
+            },
+            mixerDiagGrep = buildString {
+                append("tinymix 2>&1 | grep -iE ")
+                append("'(Incall_Music|VOC_REC_(UL|DL)|Voice.*Mute|VoiceMMode[12])'")
+            },
+            musicVolPercent = 25,
+            captureGain = 2,
+            playbackGain = 2,
+            noiseGateThreshold = 120,
+            echoGateThreshold = 300,
+            doubleTalkRatio = 1.5f,
+            requireSpeakerMode = true,
+            incallMusicParam = "incall_music_enabled",
+            voiceDownlinkWorks = true,
+            preferTelephonyCapture = true,
+            voiceCallVolPercent = 15,
+            routeChangeDelayMs = 500,
+            appopsPropagationMs = 300,
+        )
 
         /** Samsung Galaxy S4 Mini (MSM8930 / WCD9304 codec) */
         fun msm8930() = DeviceProfile(

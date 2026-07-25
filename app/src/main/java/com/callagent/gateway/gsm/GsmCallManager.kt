@@ -1,12 +1,15 @@
 package com.callagent.gateway.gsm
 
 import android.content.Context
-import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Bundle
 import android.telecom.Call
 import android.telecom.CallAudioState
 import android.telecom.InCallService
+import android.telecom.PhoneAccountHandle
+import android.telecom.TelecomManager
+import android.telephony.SubscriptionManager
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
@@ -172,15 +175,29 @@ object GsmCallManager {
             appLog("GSM dial blocked: CALL_PHONE permission is not granted")
             return false
         }
-        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
-        if (telecom?.defaultDialerPackage != context.packageName) {
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+        if (telecom == null) {
+            appLog("GSM dial blocked: Telecom service is unavailable")
+            return false
+        }
+        if (telecom.defaultDialerPackage != context.packageName) {
             appLog("GSM dial blocked: CallAgent is not the default phone app")
             return false
         }
-        val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$destination"))
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val selectedSlot = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+            .getInt("outgoing_sim_slot", 0)
+            .coerceIn(0, 1)
+        val phoneAccount = resolvePhoneAccount(context, telecom, selectedSlot)
+        if (phoneAccount == null) {
+            appLog("GSM dial blocked: no call-capable PhoneAccount for SIM${selectedSlot + 1}")
+            return false
+        }
+        val extras = Bundle().apply {
+            putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, phoneAccount)
+        }
         return try {
-            context.startActivity(intent)
+            appLog("GSM dialing via SIM${selectedSlot + 1} PhoneAccount=${phoneAccount.id}")
+            telecom.placeCall(Uri.parse("tel:$destination"), extras)
             true
         } catch (e: SecurityException) {
             appLog("GSM ACTION_CALL permission failure: ${e.message}")
@@ -189,6 +206,36 @@ object GsmCallManager {
             appLog("GSM ACTION_CALL launch failure: ${e.message}")
             false
         }
+    }
+
+    private fun resolvePhoneAccount(
+        context: Context,
+        telecom: TelecomManager,
+        selectedSlot: Int
+    ): PhoneAccountHandle? {
+        val accounts = telecom.callCapablePhoneAccounts
+        if (accounts.isEmpty()) return null
+
+        val subscriptionManager =
+            context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+        val subscriptionId = try {
+            subscriptionManager?.activeSubscriptionInfoList
+                ?.firstOrNull { it.simSlotIndex == selectedSlot }
+                ?.subscriptionId
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot read active subscriptions: ${e.message}")
+            null
+        }
+
+        // Android's telephony PhoneAccount ID is the subscription ID on the
+        // MI8 and standard AOSP telephony stacks. Prefer that exact mapping.
+        subscriptionId?.let { subId ->
+            accounts.firstOrNull { it.id == subId.toString() }?.let { return it }
+        }
+
+        // Telecom returns SIM accounts in slot order. This fallback keeps
+        // explicit routing working on vendor stacks with opaque account IDs.
+        return accounts.getOrNull(selectedSlot)
     }
 
     /** Music volume percent — from device profile. */
@@ -202,7 +249,7 @@ object GsmCallManager {
         discoveryDone = true
         Thread({
             try {
-                val discovery = DeviceProfile.discoverMixerControls()
+                val discovery = DeviceProfile.discoverMixerControls(profile)
                 for (line in discovery.lines()) {
                     if (line.isNotBlank()) Log.i(TAG, "MixerDiscovery: $line")
                 }
@@ -365,15 +412,9 @@ object GsmCallManager {
             return
         }
         try {
-            val bin = DeviceProfile.tinymixBin
-            // Step 1: Readback BEFORE — see what HAL set during call setup
-            val before = RootShell.execForOutput(buildString {
-                append("echo 'NSRC0B:'; $bin 'ABOX NSRC0 Bridge' 2>&1; ")
-                append("echo 'NSRC1B:'; $bin 'ABOX NSRC1 Bridge' 2>&1; ")
-                append("echo 'NSRC0:'; $bin 'ABOX NSRC0' 2>&1; ")
-                append("echo 'NSRC1:'; $bin 'ABOX NSRC1' 2>&1; ")
-                append("echo 'SPUS0:'; $bin 'ABOX SPUS OUT0' 2>&1")
-            }, timeoutMs = 8000)
+            val stateCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
+            // Step 1: Read back the controls relevant to this device.
+            val before = RootShell.execForOutput(stateCmd, timeoutMs = 8000)
             appLog("Mixer BEFORE: $before")
 
             // Step 2: Run mixer setup commands (all ABOX controls on card 0)
@@ -381,15 +422,8 @@ object GsmCallManager {
             val setupOutput = RootShell.execForOutput(resolvedSetup, timeoutMs = 8000)
             if (setupOutput.isNotBlank()) appLog("Mixer setup: $setupOutput")
 
-            // Step 3: Readback AFTER — verify controls were actually changed
-            val readback = RootShell.execForOutput(buildString {
-                append("echo 'NSRC0B:'; $bin 'ABOX NSRC0 Bridge' 2>&1; ")
-                append("echo 'NSRC1B:'; $bin 'ABOX NSRC1 Bridge' 2>&1; ")
-                append("echo 'NSRC2B:'; $bin 'ABOX NSRC2 Bridge' 2>&1; ")
-                append("echo 'NSRC0:'; $bin 'ABOX NSRC0' 2>&1; ")
-                append("echo 'NSRC1:'; $bin 'ABOX NSRC1' 2>&1; ")
-                append("echo 'SPUS0:'; $bin 'ABOX SPUS OUT0' 2>&1")
-            }, timeoutMs = 10000)
+            // Step 3: Readback AFTER — verify controls were actually changed.
+            val readback = RootShell.execForOutput(stateCmd, timeoutMs = 10000)
             appLog("Mixer AFTER: $readback")
         } catch (e: Exception) {
             appLog("Mixer setup FAILED: ${e.message}")

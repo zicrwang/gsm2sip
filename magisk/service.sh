@@ -60,35 +60,10 @@ for PERM in \
         log -t "$TAG" "Skip (already granted or N/A): $PERM"
 done
 
-# ── PermissionController: hidden by Magisk overlay ────
-# The module's filesystem overlay hides PermissionController's APK
-# (system/priv-app/PermissionController/.replace), so Android cannot
-# start it at all.  Previous approaches all failed:
-#   - killall: auto-restarts in ~3s
-#   - appops set --uid: overridden immediately
-#   - pm disable-user: Android still started it for service binding
-#   - Activity launch: can't get TOP state with screen locked
-#
-# With the APK hidden at the filesystem level, PermissionController
-# never runs, never sets MODE_FOREGROUND, and appops stay as set.
-#
-# Kill any instance that might have started before module mounted.
-killall com.google.android.permissioncontroller 2>/dev/null
-killall com.android.permissioncontroller 2>/dev/null
-
-# Verify PermissionController is actually gone
-if pm list packages 2>/dev/null | grep -q permissioncontroller; then
-    log -t "$TAG" "WARNING: PermissionController still visible to pm!"
-    # Fallback: force-disable it
-    pm disable com.android.permissioncontroller 2>/dev/null
-    pm disable com.google.android.permissioncontroller 2>/dev/null
-else
-    log -t "$TAG" "PermissionController: hidden by Magisk overlay"
-fi
-
 # ── Force-allow RECORD_AUDIO via appops ───────────────
-# With PermissionController gone, this setting persists permanently.
-# Set both UID-level and package-level modes for maximum compatibility.
+# Keep Android's PermissionController intact. The app reasserts this appop
+# while a call is active, so a gateway does not need to disable a core
+# system package on a general-purpose phone.
 appops set --uid "$PKG" RECORD_AUDIO allow 2>/dev/null
 appops set "$PKG" RECORD_AUDIO allow 2>/dev/null && \
     log -t "$TAG" "appops RECORD_AUDIO: forced allow (--uid + pkg)" || \
@@ -100,9 +75,6 @@ appops set "$PKG" RECORD_AUDIO allow 2>/dev/null && \
     MODE=$(appops get "$PKG" RECORD_AUDIO 2>/dev/null)
     log -t "$TAG" "appops RECORD_AUDIO verify: $MODE"
     if echo "$MODE" | grep -qi "foreground\|ignore\|deny"; then
-        # Something re-revoked — kill and re-assert
-        killall com.google.android.permissioncontroller 2>/dev/null
-        killall com.android.permissioncontroller 2>/dev/null
         appops set --uid "$PKG" RECORD_AUDIO allow 2>/dev/null
         appops set "$PKG" RECORD_AUDIO allow 2>/dev/null
         log -t "$TAG" "appops RECORD_AUDIO: re-asserted after revert"

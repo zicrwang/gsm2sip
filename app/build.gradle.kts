@@ -11,13 +11,16 @@ android {
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34
-        versionCode = 330
-        versionName = "2.8.52"
+        versionCode = 335
+        versionName = "2.8.57"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Private gateway builds use the build host's stable debug key.
+            // This produces an installable APK without committing credentials.
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

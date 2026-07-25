@@ -178,14 +178,7 @@ class RtpSession(
         // PCMA is the only negotiated codec, so both directions stay at 8 kHz.
         playbackRate = 8000
 
-        // Do not request VOICE_CALL/VOICE_DOWNLINK here.  On the affected
-        // emulator those sources can initialize while returning silence and
-        // trigger unsupported mixer controls.  Use ordinary AudioRecord
-        // inputs that the HAL actually implements.
-        val configs = mutableListOf<SourceConfig>()
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
+        val configs = buildCaptureConfigs()
 
         var record: AudioRecord? = null
         var usedSource = "none"
@@ -345,7 +338,6 @@ class RtpSession(
         // as silent.  This handles both cold-boot AudioRecord unavailability
         // AND sources that initialize but deliver no audio (e.g., VOICE_CALL
         // on Exynos 9820 where the HAL doesn't route voice data to capture).
-        val wideband = false
         val defaultRemoteInet = InetAddress.getByName(remoteAddr)
         val maxFallbacks = 5  // Maximum silent-source fallback cycles
 
@@ -353,7 +345,7 @@ class RtpSession(
             if (!running.get()) return
 
             // Build source list, filtering out sources that produced silence
-            val configs = buildCaptureConfigs(wideband)
+            val configs = buildCaptureConfigs()
             if (configs.isEmpty()) {
                 Log.e(TAG, "All capture sources produced silence — no working source found")
                 break
@@ -437,11 +429,15 @@ class RtpSession(
 
     /** Build the prioritized list of capture source configs, excluding
      *  sources already detected as silent. */
-    private fun buildCaptureConfigs(wideband: Boolean): List<SourceConfig> {
+    private fun buildCaptureConfigs(): List<SourceConfig> {
         val configs = mutableListOf<SourceConfig>()
-        // Keep this list aligned with initAudio(): telephony capture sources
-        // are deliberately excluded because unsupported HAL controls can
-        // produce a valid AudioRecord that contains only silence.
+        // Real devices with a verified telephony-recording path get clean
+        // digital downlink first. Unknown devices stay on ordinary inputs,
+        // since unsupported telephony sources often initialize as silence.
+        if (profile.preferTelephonyCapture) {
+            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
+            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
+        }
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
         configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
@@ -1108,13 +1104,10 @@ class RtpSession(
         }
         Thread({
             try {
-                // Run incall_music mixer commands, then readback key controls (card 0)
-                val bin = DeviceProfile.tinymixBin
-                val cmd = "$resolvedMixerCmd; " +
-                    "echo 'NSRC1B:'; $bin 'ABOX NSRC1 Bridge' 2>&1; " +
-                    "echo 'NSRC1:'; $bin 'ABOX NSRC1' 2>&1; " +
-                    "echo 'NSRC0:'; $bin 'ABOX NSRC0' 2>&1; " +
-                    "echo 'SPUS0:'; $bin 'ABOX SPUS OUT0' 2>&1"
+                // Run device-specific mixer commands, then read back only
+                // controls that exist on the selected profile.
+                val stateCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
+                val cmd = "$resolvedMixerCmd; echo '=== mixer readback ==='; $stateCmd"
                 val output = RootShell.execForOutput(cmd, timeoutMs = 8000)
                 val msg = "Mixer incall_music: $output"
                 Log.i(TAG, msg)
@@ -1229,15 +1222,8 @@ class RtpSession(
             if (tinymix.isNotEmpty()) {
                 Thread({
                     try {
-                        // Phase 1: NSRC routing + bridge state
-                        val routingCmd = buildString {
-                            append("echo '=== NSRC routing ==='; ")
-                            for (i in 0..2) {
-                                append("echo -n 'NSRC${i}='; $tinymix 'ABOX NSRC${i}' 2>/dev/null || echo 'N/A'; ")
-                                append("echo -n 'NSRC${i}_Bridge='; $tinymix 'ABOX NSRC${i} Bridge' 2>/dev/null || echo 'N/A'; ")
-                            }
-                            append("echo -n 'SoundType='; $tinymix 'ABOX Sound Type' 2>/dev/null || echo 'N/A'")
-                        }
+                        // Phase 1: device-specific mixer routing state
+                        val routingCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
                         val routing = RootShell.execForOutput(routingCmd, timeoutMs = 8000)
                         for (line in routing.lines().filter { it.isNotBlank() }) {
                             Log.i(TAG, "Diag: $line")
@@ -1300,14 +1286,7 @@ class RtpSession(
                         // after enableIncallMusic/enableIncallMusicViaMixer run.
                         Thread.sleep(5000)
                         if (running.get()) {
-                            val recheck = buildString {
-                                append("echo '=== NSRC re-check (t+5s) ==='; ")
-                                for (i in 0..2) {
-                                    append("echo -n 'NSRC${i}='; $tinymix 'ABOX NSRC${i}' 2>/dev/null || echo 'N/A'; ")
-                                    append("echo -n 'NSRC${i}_Bridge='; $tinymix 'ABOX NSRC${i} Bridge' 2>/dev/null || echo 'N/A'; ")
-                                }
-                                append("echo -n 'SoundType='; $tinymix 'ABOX Sound Type' 2>/dev/null || echo 'N/A'")
-                            }
+                            val recheck = "echo '=== mixer re-check (t+5s) ==='; $routingCmd"
                             val recheckResult = RootShell.execForOutput(recheck, timeoutMs = 8000)
                             for (line in recheckResult.lines().filter { it.isNotBlank() }) {
                                 Log.i(TAG, "Diag: $line")
