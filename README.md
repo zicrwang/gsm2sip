@@ -48,6 +48,24 @@ Only the Magisk module needs to be installed — it includes the APK and handles
 4. **Configure SIP**: Enter your Asterisk server address, port, username, and password
 5. **Start**: Tap START — the app registers with Asterisk and begins bridging calls
 
+### Web Debug Page
+
+The APK included in the Magisk module contains a lightweight LAN debug page. After
+rebooting and starting the gateway, tap **WEB** in the app settings, or open:
+
+```text
+http://<Android-phone-IP>:8787/
+```
+
+The page shows gateway state, SIP connection details, recent runtime logs, and
+controls for start, stop, and statistics reload. The Android phone and browser
+must be on the same LAN. The page is intended for local debugging and should not
+be exposed directly to the Internet.
+
+The standalone `gateway.apk` can be used for a quick Web Debug Page test, but
+normal telephony use should install only `gateway-magisk.zip`, because the module
+already contains the APK and supplies the required privileged audio permissions.
+
 ## Asterisk Configuration
 
 ### 1. Create a SIP account for the gateway

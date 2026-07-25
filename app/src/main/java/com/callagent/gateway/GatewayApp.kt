@@ -4,6 +4,7 @@ import android.app.Application
 import com.callagent.gateway.BuildConfig
 import android.os.StrictMode
 import android.util.Log
+import com.callagent.gateway.service.WebDebugServer
 
 class GatewayApp : Application() {
     override fun onCreate() {
@@ -15,5 +16,6 @@ class GatewayApp : Application() {
             StrictMode.ThreadPolicy.Builder().permitAll().build()
         )
         Log.i("GatewayApp", "SIP-GSM Gateway v${BuildConfig.VERSION_NAME} started")
+        WebDebugServer.start(this)
     }
 }

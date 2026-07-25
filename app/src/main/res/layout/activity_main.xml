@@ -330,6 +330,16 @@
                         android:backgroundTint="@color/btn_secondary"
                         android:textColor="#FFFFFF"
                         android:layout_marginStart="3dp" />
+
+                    <Button
+                        android:id="@+id/btnWebDebug"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="WEB"
+                        android:backgroundTint="@color/primary"
+                        android:textColor="#FFFFFF"
+                        android:layout_marginStart="3dp" />
                 </LinearLayout>
 
                 <!-- Log fills remaining space -->

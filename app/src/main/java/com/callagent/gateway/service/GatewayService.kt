@@ -258,6 +258,9 @@ class GatewayService : Service() {
         cfgPort = port
         cfgUser = username
         cfgPass = password
+        webServer = server
+        webPort = port
+        webUser = username
 
         notifStatusText = "Connecting"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -421,6 +424,7 @@ class GatewayService : Service() {
         if (stopped) return
         stopped = true
         onlineSince = 0L
+        webOnlineSince = 0L
         Log.i(TAG, "Stopping gateway")
         orchestrator?.stop()
         sipClient?.stop()
@@ -510,6 +514,9 @@ class GatewayService : Service() {
     // ── Broadcast to MainActivity ────────────────────────
 
     private fun broadcastStatus(state: String, info: String) {
+        webState = state
+        webInfo = info
+        webOnlineSince = onlineSince
         val intent = Intent(STATUS_ACTION).apply {
             setPackage(packageName)
             putExtra("state", state)
@@ -529,6 +536,7 @@ class GatewayService : Service() {
             logBuffer.add(msg)
             if (logBuffer.size > LOG_BUFFER_SIZE) logBuffer.removeAt(0)
         }
+        logWeb(msg)
         val intent = Intent(LOG_ACTION).apply {
             setPackage(packageName)
             putExtra("msg", msg)
@@ -652,6 +660,41 @@ class GatewayService : Service() {
         private const val LOG_BUFFER_SIZE = 200
         /** Ring buffer of recent log messages — survives activity pause/resume. */
         val logBuffer = mutableListOf<String>()
+        private const val WEB_LOG_BUFFER_SIZE = 400
+        private val webLogBuffer = mutableListOf<String>()
+        @Volatile var webState: String = "STOPPED"
+        @Volatile var webInfo: String = "Gateway not started"
+        @Volatile var webServer: String = ""
+        @Volatile var webPort: Int = 5060
+        @Volatile var webUser: String = ""
+        @Volatile var webOnlineSince: Long = 0L
+
+        fun logWeb(msg: String) = synchronized(webLogBuffer) {
+            webLogBuffer.add(msg)
+            if (webLogBuffer.size > WEB_LOG_BUFFER_SIZE) webLogBuffer.removeAt(0)
+        }
+
+        fun webLogSnapshot(): List<String> = synchronized(webLogBuffer) { webLogBuffer.toList() }
+
+        fun localIp(): String {
+            try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                if (iface.isLoopback || !iface.isUp) continue
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address is java.net.Inet4Address && !address.isLoopbackAddress) {
+                        return address.hostAddress ?: continue
+                    }
+                }
+            }
+            } catch (_: Exception) {
+                return "0.0.0.0"
+            }
+            return "0.0.0.0"
+        }
 
         /** Drain buffered logs.  Returns all messages and clears the buffer. */
         fun drainLogBuffer(): List<String> = synchronized(logBuffer) {
@@ -690,6 +733,12 @@ class GatewayService : Service() {
                 action = ACTION_STOP
             }
             context.startService(intent)
+        }
+
+        fun reload(context: Context) {
+            context.startService(Intent(context, GatewayService::class.java).apply {
+                action = ACTION_RELOAD_STATS
+            })
         }
     }
 }

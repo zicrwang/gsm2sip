@@ -52,6 +52,7 @@ import androidx.core.content.ContextCompat
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
 import com.callagent.gateway.service.GatewayService
+import com.callagent.gateway.service.WebDebugServer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -66,6 +67,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var svLog: ScrollView
     private lateinit var btnStart: Button
     private lateinit var btnCopyLog: Button
+    private lateinit var btnWebDebug: Button
     private lateinit var btnConfig: ImageButton
     private lateinit var btnInfo: ImageButton
 
@@ -296,6 +298,7 @@ class MainActivity : AppCompatActivity() {
         GatewayService.drainLogBuffer()
         btnStart = findViewById(R.id.btnStart)
         btnCopyLog = findViewById(R.id.btnCopyLog)
+        btnWebDebug = findViewById(R.id.btnWebDebug)
         btnConfig = findViewById(R.id.btnConfig)
         btnInfo = findViewById(R.id.btnInfo)
 
@@ -321,6 +324,7 @@ class MainActivity : AppCompatActivity() {
         // Settings-tab click listeners
         btnStart.setOnClickListener { if (running) stopGateway() else startGateway() }
         btnCopyLog.setOnClickListener { copyLog() }
+        btnWebDebug.setOnClickListener { WebDebugServer.openInBrowser(this) }
         btnConfig.setOnClickListener { showConfigDialog() }
         btnInfo.setOnClickListener { showInfoDialog() }
         // Calls-tab click listeners
