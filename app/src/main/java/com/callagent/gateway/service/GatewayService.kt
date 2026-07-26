@@ -308,17 +308,21 @@ class GatewayService : Service() {
         selectedLocalIp = localIp
         broadcastLog("Local IP: $localIp")
 
-        // STUN: discover public IP for NAT traversal
-        val stunResult = try { StunClient.discover() } catch (e: Exception) {
-            Log.e(TAG, "STUN exception: ${e.javaClass.simpleName}: ${e.message}")
-            null
-        }
         // For a private SIP server, advertise the route-local address. A STUN
-        // result is a public/NAT address and is not reachable from the LAN.
+        // result is unnecessary and not reachable from the LAN, so do not
+        // block registration while public STUN servers time out.
         val useLocalAddress = isPrivateIpv4(cfgServer) && isPrivateIpv4(localIp)
+        val stunResult = if (useLocalAddress) {
+            null
+        } else {
+            try { StunClient.discover() } catch (e: Exception) {
+                Log.e(TAG, "STUN exception: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+        }
         val publicIp = if (useLocalAddress) localIp else stunResult?.publicIp ?: localIp
-        if (useLocalAddress && stunResult != null) {
-            broadcastLog("Private SIP server, using local IP for SDP: $localIp")
+        if (useLocalAddress) {
+            broadcastLog("Private SIP server, skipping STUN and using local IP: $localIp")
         } else if (stunResult != null) {
             broadcastLog("STUN public IP: ${stunResult.publicIp}:${stunResult.publicPort}")
         } else {
