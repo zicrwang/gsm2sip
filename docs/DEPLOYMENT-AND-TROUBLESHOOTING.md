@@ -158,16 +158,16 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-b3dbfa1fc16874444ef63d18da639c7853a263711d402645cc08bc7de626f44a
+72fb66f8272e6f6b6fdc812c0dbe4ddba9835d55e28a6af4703a0a4f56fb18d5
 
 gateway-magisk.zip
-531d390b16a6b6e68c18f4f4b73656c0d77f23d3e9eddf12d178483f25e7ecbe
+6005fefd8161b3ef1e12a4faaa80d3785f6233f2ef32b84314bc13eea1089090
 ```
 
-APK 版本应为 `2.8.68`（versionCode `346`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.69`（versionCode `347`），并通过 APK Signature Scheme
 v2 验证。
 
-v2.8.68 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+v2.8.69 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
 incall_music 数字注入；桥接期间断开 `CDC_IF TX6/TX7/TX8` 物理麦克风前端，
 并关闭 MultiMedia1 到本机 QUAT 接收器/扬声器的渲染支路。`Voice Tx Mute`
 保持关闭，因此数字注入不会随全局蜂窝 TX 一起被静音。SIP 200 OK 前必须完成

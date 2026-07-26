@@ -92,6 +92,7 @@ class RtpSession(
     @Volatile private var firstTxInfo = ""
     @Volatile private var lastCaptureFrameElapsed = 0L
     @Volatile private var signalingConnected = false
+    @Volatile private var postConnectDiagnosticsEnabled = false
     private val captureDiagnosticsStarted = AtomicBoolean(false)
     private val captureFrameLock = Object()
     private val playbackReady = CountDownLatch(1)
@@ -225,6 +226,10 @@ class RtpSession(
         captureStart.countDown()
         signalingConnected = true
         lastRtpReceivedTime = System.currentTimeMillis()
+    }
+
+    fun startPostConnectDiagnostics() {
+        postConnectDiagnosticsEnabled = true
         maybeStartCaptureDiagnostics()
     }
 
@@ -1288,10 +1293,10 @@ class RtpSession(
      * Phase 7: ALSA capture PCM probe (tinycap, if available)
      */
     private fun maybeStartCaptureDiagnostics() {
-        if (!signalingConnected) return
+        if (!signalingConnected || !postConnectDiagnosticsEnabled) return
         val record = audioRecord ?: return
         if (captureDiagnosticsStarted.compareAndSet(false, true)) {
-            Log.i(TAG, "Starting capture diagnostics after SIP signaling connected")
+            Log.i(TAG, "Starting capture diagnostics after connected signaling completed")
             logCaptureDiagnostics(record)
         }
     }

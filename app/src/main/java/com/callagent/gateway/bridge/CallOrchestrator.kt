@@ -274,6 +274,7 @@ class CallOrchestrator(
                             Log.w(TAG, "Bridge torn down during RTP setup — not transitioning to BRIDGED")
                             return@Thread
                         }
+                        activeRtpSession?.startPostConnectDiagnostics()
                         bridgeState = BridgeState.BRIDGED
                         listener?.onStateChanged(bridgeState, "Bridged (inbound)")
                         Log.i(TAG, "Inbound bridge established — zero dead air")
@@ -331,6 +332,7 @@ class CallOrchestrator(
                         }
 
                         sipCall.accept(rtpPort, mediaReady = true)
+                        activeRtpSession?.startPostConnectDiagnostics()
                         bridgeState = BridgeState.BRIDGED
                         listener?.onStateChanged(bridgeState, "Bridged (outbound)")
                         val activeToAnswerMs = SystemClock.elapsedRealtime() - lastGsmActiveElapsed
@@ -423,6 +425,7 @@ class CallOrchestrator(
                         Log.w(TAG, "Bridge torn down during RTP setup — not transitioning to BRIDGED")
                         return@Thread
                     }
+                    activeRtpSession?.startPostConnectDiagnostics()
                     bridgeState = BridgeState.BRIDGED
                     listener?.onStateChanged(bridgeState, "Bridged (dialler)")
                     Log.i(TAG, "Dialler bridge established (codec=$codecName)")
@@ -454,6 +457,7 @@ class CallOrchestrator(
                 tearDown("RTP setup failed")
                 return
             }
+            activeRtpSession?.startPostConnectDiagnostics()
             bridgeState = BridgeState.BRIDGED
             listener?.onStateChanged(bridgeState, "Bridged (inbound)")
             Log.i(TAG, "Bridge established (codec=$codecName)")

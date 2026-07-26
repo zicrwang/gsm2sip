@@ -50,7 +50,7 @@ export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=10808 -Dhttps.pr
 ```
 
 测试覆盖 RTP 扩展头/填充解析、乱序、重复包、丢包、序列号回绕、SSRC 切换和
-缓冲溢出。当前发布版本应为 `2.8.68`（versionCode `346`）。
+缓冲溢出。当前发布版本应为 `2.8.69`（versionCode `347`）。
 
 Release APK 必须经过签名。当前私有设备构建使用编译机上固定的 Android debug
 keystore，便于后续版本使用同一签名升级；该签名不适合公开发行。
