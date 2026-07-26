@@ -21,7 +21,11 @@ properties required by the bridge.
 
 ## Audio Codec
 
-PCMA (G.711 A-law, 8 kHz) for compatibility with Android audio HALs and Asterisk.
+PCMA (G.711 A-law, 8 kHz, 20 ms/160-byte RTP frames) for compatibility with
+Android audio HALs and Asterisk. Receive audio uses a sequence-aware bounded
+jitter buffer before the existing deep-buffer `AudioTrack` path. Details and
+acceptance metrics are documented in
+[docs/RTP-AND-MEDIA-READINESS.md](docs/RTP-AND-MEDIA-READINESS.md).
 
 ## Requirements
 
@@ -147,7 +151,7 @@ same => n,Hangup()
                                  │         │         │
                                  │  ┌──────▼───────┐ │
                                  │  │  SIP Client   │ │  Registration + calls
-                                 │  │  RTP Session  │ │  G.722 audio stream
+                                 │  │  RTP Session  │ │  PCMA audio stream
                                  │  └──────┬───────┘ │
                                  └─────────┼─────────┘
                                            │ SIP/RTP

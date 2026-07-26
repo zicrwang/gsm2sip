@@ -73,6 +73,9 @@ data class DeviceProfile(
      *  before acoustic microphone fallbacks. */
     val preferTelephonyCapture: Boolean = false,
 
+    /** Apply the mixer setup before requesting the speaker route. */
+    val setupMixerBeforeRoute: Boolean = false,
+
     /** Voice call stream volume as percentage of max (0=minimum non-zero).
      *  Controls the caller's voice volume on the speaker.
      *  MSM8930: 0 (muted via tinymix muteVoiceRx).
@@ -277,6 +280,7 @@ data class DeviceProfile(
             incallMusicParam = "incall_music_enabled",
             voiceDownlinkWorks = true,
             preferTelephonyCapture = true,
+            setupMixerBeforeRoute = true,
             voiceCallVolPercent = 1,
             routeChangeDelayMs = 500,
             appopsPropagationMs = 300,

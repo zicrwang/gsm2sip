@@ -14,7 +14,11 @@
 
 ## 2. 编解码配置
 
-CallAgent 当前固定使用 PCMA（G.711 A-law，RTP payload type 8，8 kHz）。这是有意的兼容性选择：部分 Android 模拟器或旧音频 HAL 会声明支持宽带音频，但实际无法建立通话音频通道。
+CallAgent 当前固定使用 PCMA（G.711 A-law，RTP payload type 8，8 kHz，
+每包 160 字节/20 ms）。这是有意的兼容性选择：部分 Android 模拟器或旧音频
+HAL 会声明支持宽带音频，但实际无法建立通话音频通道。接收端先经过按 RTP
+扩展序列号排序的 3 帧预缓冲和 5 帧有界队列，再进入设备所需的深缓冲
+`AudioTrack`；具体状态和指标见 [RTP 与媒体就绪](RTP-AND-MEDIA-READINESS.md)。
 
 Asterisk 的 `chan_sip` 账号建议配置为：
 
@@ -126,7 +130,12 @@ GSM dial timeout
 
 ### `RTP ready` 但无声音
 
-确认 Asterisk 的 RTP 端口可达、`directmedia=no` 已设置，并检查 CallAgent 日志中的 `txPacketCount`、`rxPacketCount`、`captureRms` 和 `playbackRms`。只有 `rxPacketCount` 增长表示收到对端 RTP；只有 `txPacketCount` 增长表示 CallAgent 正在发送音频。
+确认 Asterisk 的 RTP 端口可达、`directmedia=no` 已设置，并检查 CallAgent 日志中
+的 `txPacketCount`、`rxPacketCount`、`captureRms`、`playbackRms`、`overflow`、
+`duplicate`、`reordered`、`late`、`concealed`、`underrun`、`resync` 和
+`jitterMs`。只有 `rxPacketCount` 增长表示收到对端 RTP；只有 `txPacketCount`
+增长表示 CallAgent 正在发送音频。干净局域网中 `overflow` 应为 0，补偿和欠载
+应接近 0。
 
 ### Contact 或 SDP 使用错误地址
 
@@ -144,21 +153,21 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-9fadf0fee0f0bf2065092d1efc14f7595122620ba499e58b750bc1326ffb39ee
+70bf74c2bfe2d9da1e381fa1911c3eca81a997798f279dcda9485cf283e350c3
 
 gateway-magisk.zip
-32332c1e553184a465b0a5110d6875c1c9a8df71bd6a9f3ab8b1ee1703b1d49a
+386f57310e1cf433f3b1ef4fa1cb996a000cf965c44e25ebe85883488c31276e
 ```
 
-APK 版本应为 `2.8.61`（versionCode `339`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.64`（versionCode `342`），并通过 APK Signature Scheme
 v2 验证。
 
-v2.8.61 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+v2.8.64 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
 incall_music 数字注入，并在桥接期间静音物理 Voice RX endpoint；挂断后
-恢复 mixer。该版本还会在 SIP 200 OK 前完成 RTP/音频初始化，降低数字下行
-噪声门限，并延长静音源判定窗口，避免外拨接通后的开头语音被静音或误切源；
-重复的启动请求在首次初始化完成前会被忽略，避免多个 SIP 客户端争用端口；
-内网 SIP 服务器直接使用路由本地地址，不再等待无意义的公网 STUN 超时。
+恢复 mixer。SIP 200 OK 前必须完成 GSM ACTIVE、RTP socket、播放线程和捕获帧
+就绪；重复启动请求在首次初始化完成前会被忽略。RTP 接收新增序列号回绕、
+乱序/重复/迟到处理、有界抖动缓冲和短时丢包衰减补偿；启动 NAT priming 使用
+有效的 PCMA A-law 静音并推进 RTP 序列号和时间戳。
 
 ## 7. 仍需在设备端完成的事项
 

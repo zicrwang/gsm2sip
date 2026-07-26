@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.telecom.Call
 import android.telecom.CallAudioState
 import android.telecom.InCallService
@@ -41,6 +42,9 @@ object GsmCallManager {
     @Volatile var inCallService: InCallService? = null; private set
 
     @Volatile var listener: Listener? = null
+
+    private val audioPreparationLock = Any()
+    @Volatile private var audioPreparationCall: Call? = null
 
     /** Optional callback for routing important audio diagnostics to the
      *  app log viewer (Settings tab).  Set by GatewayService. */
@@ -84,15 +88,20 @@ object GsmCallManager {
                 } catch (e: Exception) {
                     Log.w(TAG, "Ringer silence failed: ${e.message}")
                 }
+                prepareAudioBridge(call)
                 listener?.onIncomingGsmCall(call, number)
             }
             Call.STATE_DIALING, Call.STATE_CONNECTING -> {
                 Log.i(TAG, "Outgoing GSM call to $number")
+                prepareAudioBridge(call)
+                listener?.onGsmCallStateChanged(call, call.state)
             }
             Call.STATE_ACTIVE -> {
                 Log.i(TAG, "GSM call active: $number")
-                configureAudioBridge()
+                // Downlink media starts at ACTIVE. Do not hold RTP startup
+                // behind the MI8 speaker-route transition.
                 listener?.onGsmCallActive(call)
+                prepareAudioBridge(call)
             }
         }
     }
@@ -102,6 +111,9 @@ object GsmCallManager {
         if (activeCall == call) {
             activeCall = null
             activeCallState = Call.STATE_DISCONNECTED
+        }
+        synchronized(audioPreparationLock) {
+            if (audioPreparationCall === call) audioPreparationCall = null
         }
         restoreAudio()
         listener?.onGsmCallEnded(call)
@@ -122,12 +134,14 @@ object GsmCallManager {
                 // the orchestrator never learns about the incoming call.
                 val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
                 Log.i(TAG, "GSM call ringing: $number (via state change)")
+                prepareAudioBridge(call)
                 listener?.onIncomingGsmCall(call, number)
             }
+            Call.STATE_DIALING, Call.STATE_CONNECTING -> prepareAudioBridge(call)
             Call.STATE_ACTIVE -> {
                 Log.i(TAG, "GSM call active")
-                configureAudioBridge()
                 listener?.onGsmCallActive(call)
+                prepareAudioBridge(call)
             }
             Call.STATE_DISCONNECTED -> {
                 Log.i(TAG, "GSM call disconnected")
@@ -266,9 +280,32 @@ object GsmCallManager {
         }, "MixerDiscovery").start()
     }
 
+    /**
+     * Run slow route and mixer preparation outside Telecom's call-state
+     * callback. Outgoing calls start this while still DIALING.
+     */
+    private fun prepareAudioBridge(call: Call) {
+        synchronized(audioPreparationLock) {
+            if (audioPreparationCall === call) return
+            audioPreparationCall = call
+        }
+
+        Thread({
+            val startedAt = SystemClock.elapsedRealtime()
+            appLog("Audio prepare started: state=${call.state} profile=${profile.name}")
+            configureAudioBridge(call)
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            appLog("Audio prepare finished in ${elapsed}ms: state=${call.state}")
+        }, "GSM-Audio-Prepare").start()
+    }
+
     /** Configure audio for GSM↔SIP bridge using the active device profile. */
-    private fun configureAudioBridge() {
+    private fun configureAudioBridge(call: Call) {
         try {
+            // MI8 captures the telephony RX device digitally. Mute its physical
+            // endpoint before Telecom begins the slow speaker-route transition.
+            if (profile.setupMixerBeforeRoute) applyMixerSetupEarly()
+
             // Run ABOX/ALSA discovery on first call for diagnostics
             runMixerDiscovery()
 
@@ -282,6 +319,11 @@ object GsmCallManager {
 
                 if (profile.requireSpeakerMode) {
                     service.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+                }
+
+                if (activeCall !== call || activeCallState == Call.STATE_DISCONNECTED) {
+                    Log.i(TAG, "Audio preparation completed after call ended; skipping volume setup")
+                    return
                 }
 
                 audioManager?.let { am ->
@@ -298,6 +340,9 @@ object GsmCallManager {
                     Thread({
                         try {
                             Thread.sleep(profile.routeChangeDelayMs)
+                            if (activeCall !== call || activeCallState == Call.STATE_DISCONNECTED) {
+                                return@Thread
+                            }
                             enforceVolumes(am)
                             batchMixerSetup()
                         } catch (_: Exception) {}
@@ -320,6 +365,21 @@ object GsmCallManager {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to configure audio: ${e.message}")
+        }
+    }
+
+    /** Apply only the mixer mutations, without the delayed diagnostic dumps. */
+    private fun applyMixerSetupEarly() {
+        val resolvedSetup = DeviceProfile.resolveCmd(profile.mixerSetupCmd)
+        if (resolvedSetup.isEmpty()) return
+        try {
+            val startedAt = SystemClock.elapsedRealtime()
+            val output = RootShell.execForOutput(resolvedSetup, timeoutMs = 5000)
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            if (output.isNotBlank()) Log.i(TAG, "Early mixer setup: $output")
+            appLog("Early mixer setup applied in ${elapsed}ms")
+        } catch (e: Exception) {
+            appLog("Early mixer setup FAILED: ${e.message}")
         }
     }
 

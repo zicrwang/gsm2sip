@@ -343,7 +343,11 @@ class SipClient(
         msg.sdpRtpPort?.let { call.remoteRtpPort = it }
         msg.sdpAddress?.let { call.remoteRtpAddress = it }
         call.negotiatedPayloadType = msg.sdpPreferredPayloadType
-        Log.i(TAG, "Incoming INVITE codec: pt=${call.negotiatedPayloadType} codecs=${msg.sdpCodecs}")
+        Log.i(
+            TAG,
+            "Incoming INVITE codec: pt=${call.negotiatedPayloadType} " +
+                "codecs=${msg.sdpCodecs} wphoneMediaReady=${msg.wphoneMediaReady}"
+        )
 
         // Check for GSM-forward header
         call.gsmForwardNumber = msg.gsmForwardNumber

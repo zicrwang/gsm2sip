@@ -211,21 +211,25 @@ class SipCall(
     }
 
     /** Accept an inbound INVITE: send 200 OK with SDP */
-    fun accept(localRtpPort: Int) {
+    fun accept(localRtpPort: Int, mediaReady: Boolean = false) {
         this.localRtpPort = localRtpPort
         val invite = originalInvite ?: return
         val toTag = localTag
 
         val ok = SipBuilder.ok200(
             invite, sipClient.username, sipClient.publicIp, sipClient.localPort,
-            localRtpPort = localRtpPort, toTag = toTag
+            localRtpPort = localRtpPort, toTag = toTag, mediaReady = mediaReady
         )
 
         val address = invite.contactAddress ?: sipClient.serverAddress
         sipClient.sendResponse(ok, address)
 
         state = State.ANSWERED
-        Log.i(TAG, "Sent 200 OK for inbound call $callId (RTP port: $localRtpPort)")
+        Log.i(
+            TAG,
+            "Sent 200 OK for inbound call $callId " +
+                "(RTP port: $localRtpPort, mediaReady=$mediaReady)"
+        )
     }
 
     /** Send ACK for a received 200 OK */

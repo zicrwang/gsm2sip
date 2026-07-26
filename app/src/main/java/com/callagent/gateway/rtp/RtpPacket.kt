@@ -46,6 +46,8 @@ class RtpPacket(
             val b0 = buf.get().toInt() and 0xFF
             val version = (b0 shr 6) and 0x03
             if (version != 2) return null
+            val hasPadding = (b0 and 0x20) != 0
+            val hasExtension = (b0 and 0x10) != 0
             val csrcCount = b0 and 0x0F
 
             val b1 = buf.get().toInt() and 0xFF
@@ -56,10 +58,25 @@ class RtpPacket(
             val ts = buf.int.toLong() and 0xFFFFFFFFL
             val ssrc = buf.int.toLong() and 0xFFFFFFFFL
 
-            val headerSize = 12 + csrcCount * 4
+            var headerSize = 12 + csrcCount * 4
             if (length < headerSize) return null
+            if (hasExtension) {
+                if (length < headerSize + 4) return null
+                val extensionWords = ((data[headerSize + 2].toInt() and 0xFF) shl 8) or
+                        (data[headerSize + 3].toInt() and 0xFF)
+                headerSize += 4 + extensionWords * 4
+                if (length < headerSize) return null
+            }
 
-            val payload = ByteArray(length - headerSize)
+            var payloadEnd = length
+            if (hasPadding) {
+                val paddingBytes = data[length - 1].toInt() and 0xFF
+                if (paddingBytes == 0 || paddingBytes > payloadEnd - headerSize) return null
+                payloadEnd -= paddingBytes
+            }
+            if (payloadEnd <= headerSize) return null
+
+            val payload = ByteArray(payloadEnd - headerSize)
             System.arraycopy(data, headerSize, payload, 0, payload.size)
 
             return RtpPacket(pt, seq, ts, ssrc, payload, marker)

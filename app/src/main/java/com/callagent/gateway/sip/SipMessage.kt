@@ -143,6 +143,9 @@ class SipMessage private constructor(
     val gsmForwardNumber: String?
         get() = header("x-gsm-forward")?.trim()
 
+    val wphoneMediaReady: Boolean
+        get() = header("x-wphone-media-ready")?.trim() == "1"
+
     /** Serialize this message back to a SIP packet string */
     fun encode(): String {
         val sb = StringBuilder()
@@ -257,7 +260,8 @@ object SipBuilder {
         msg: SipMessage,
         username: String, localIp: String, localPort: Int,
         localRtpPort: Int? = null,
-        toTag: String = tag()
+        toTag: String = tag(),
+        mediaReady: Boolean = false
     ): String {
         val to = msg.to ?: ""
         val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
@@ -270,6 +274,7 @@ object SipBuilder {
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
             append("Contact: <sip:$username@$localIp:$localPort>\r\n")
+            if (mediaReady) append("X-CallAgent-Media-Ready: 1\r\n")
             if (sdp != null) {
                 append("Content-Type: application/sdp\r\n")
                 append("Content-Length: ${sdp.length}\r\n\r\n")

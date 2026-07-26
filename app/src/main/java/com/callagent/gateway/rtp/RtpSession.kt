@@ -9,6 +9,7 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.SystemClock
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
@@ -18,7 +19,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -46,7 +47,8 @@ class RtpSession(
     private val localPort: Int,
     private val remoteAddr: String,
     private val remotePort: Int,
-    private val payloadType: Int = RtpPacket.PT_PCMA
+    private val payloadType: Int = RtpPacket.PT_PCMA,
+    private val appOpsPropagationDelayMs: Long? = null,
 ) {
     private val running = AtomicBoolean(false)
     private var socket: DatagramSocket? = null
@@ -66,13 +68,12 @@ class RtpSession(
     @Volatile private var latchedAddr: InetAddress? = null
     @Volatile private var latchedPort: Int = 0
 
-    // Jitter buffer for received packets.  Capacity 8 (160ms) absorbs
-    // network jitter without audible gaps.  The playback loop drains
-    // excess above 5 (100ms) to bound latency — acceptable for a GSM
-    // bridge that already has 100-200ms of inherent GSM latency.
-    // Previous capacity=3 was too aggressive: any slight jitter caused
-    // packet drops and choppy audio.
-    private val jitterBuffer = ArrayBlockingQueue<ByteArray>(8)
+    // Three 20ms frames establish a bounded playout timeline without adding
+    // another deep queue on top of AudioTrack and the GSM modem path.
+    private val jitterBuffer = RtpJitterBuffer(
+        initialPrefillFrames = 3,
+        maximumFrames = 5,
+    )
 
     // RTP inactivity tracking
     @Volatile private var lastRtpReceivedTime = 0L
@@ -89,6 +90,11 @@ class RtpSession(
     @Volatile private var playbackUsageName = "MEDIA"
     @Volatile private var firstRxInfo = ""
     @Volatile private var firstTxInfo = ""
+    @Volatile private var lastCaptureFrameElapsed = 0L
+    @Volatile private var signalingConnected = false
+    private val captureFrameLock = Object()
+    private val playbackReady = CountDownLatch(1)
+    private val captureStart = CountDownLatch(1)
 
     // Capture and playback rates may differ.  VOICE_CALL on MSM8930
     // only initializes at 8 kHz; G.722 decoding outputs 16 kHz PCM.
@@ -150,8 +156,22 @@ class RtpSession(
         // Send initial RTP keepalive to punch NAT pinhole before audio starts
         try {
             val remoteInet = InetAddress.getByName(remoteAddr)
-            val silence = RtpPacket(payloadType, 0, 0, txSsrc, ByteArray(160)).encode()
+            val silencePayload = if (payloadType == RtpPacket.PT_PCMA) {
+                ByteArray(160) { 0xD5.toByte() }
+            } else {
+                ByteArray(160)
+            }
+            val silence = RtpPacket(
+                payloadType,
+                txSequence,
+                txTimestamp,
+                txSsrc,
+                silencePayload
+            ).encode()
             socket?.send(DatagramPacket(silence, silence.size, remoteInet, remotePort))
+            txSequence = (txSequence + 1) and 0xFFFF
+            txTimestamp += 160
+            txPacketCount++
             Log.i(TAG, "Sent NAT punch-through packet to $remoteAddr:$remotePort")
         } catch (e: Exception) {
             Log.w(TAG, "NAT punch-through failed: ${e.message}")
@@ -165,6 +185,45 @@ class RtpSession(
 
         listener?.onRtpStarted()
         return true
+    }
+
+    /** Wait for the injection path and for a capture frame produced after GSM ACTIVE. */
+    fun awaitMediaReady(captureAfterElapsed: Long, timeoutMs: Long): Boolean {
+        val startedAt = SystemClock.elapsedRealtime()
+        captureStart.countDown()
+        if (!playbackReady.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            Log.e(TAG, "Media ready timeout: playback did not start in ${timeoutMs}ms")
+            return false
+        }
+        // Telecom may reset call-path mixer controls at the DIALING→ACTIVE
+        // transition. Re-assert them synchronously before signaling answer.
+        enableIncallMusic()
+        if (!applyIncallMusicMixer()) {
+            Log.e(TAG, "Media ready gate: playback injection mixer is not ready")
+            return false
+        }
+
+        synchronized(captureFrameLock) {
+            while (running.get() && lastCaptureFrameElapsed < captureAfterElapsed) {
+                val remaining = timeoutMs - (SystemClock.elapsedRealtime() - startedAt)
+                if (remaining <= 0) break
+                captureFrameLock.wait(remaining)
+            }
+        }
+        val ready = running.get() && lastCaptureFrameElapsed >= captureAfterElapsed
+        val elapsed = SystemClock.elapsedRealtime() - startedAt
+        Log.i(
+            TAG,
+            "Media ready gate: ready=$ready wait=${elapsed}ms " +
+                "captureAfter=$captureAfterElapsed lastCapture=$lastCaptureFrameElapsed"
+        )
+        return ready
+    }
+
+    fun markSignalingConnected() {
+        captureStart.countDown()
+        signalingConnected = true
+        lastRtpReceivedTime = System.currentTimeMillis()
     }
 
     /**
@@ -197,11 +256,11 @@ class RtpSession(
             // On cold boot, the single appops call in CallOrchestrator
             // gets re-revoked before AudioRecord creation.  Re-asserting
             // here with a propagation delay keeps the permission alive.
-            reAssertAppOps()
-            // 500ms propagation delay (was 150ms).  On cold boot, system services
-            // are all starting simultaneously and AudioFlinger takes longer to see
-            // the appops change.  150ms was too short — all 5 attempts would fail.
-            Thread.sleep(500)
+            val propagationDelay = appOpsPropagationDelayMs ?: run {
+                reAssertAppOps()
+                profile.appopsPropagationMs
+            }
+            if (propagationDelay > 0) Thread.sleep(propagationDelay)
 
             for (cfg in configs) {
                 try {
@@ -329,6 +388,14 @@ class RtpSession(
      * direction (GSM→SIP) takes longer to come up.
      */
     private fun captureInitAndLoop() {
+        try {
+            captureStart.await()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return
+        }
+        if (!running.get()) return
+
         // Fast path: AudioRecord was already initialized in initAudio (warm boot)
         if (audioRecord != null) {
             if (captureLoop() || !running.get()) return
@@ -365,8 +432,13 @@ class RtpSession(
             for (attempt in 1..maxAttempts) {
                 if (!running.get()) return
 
-                reAssertAppOps()
-                sendSilencePackets(500, defaultRemoteInet)
+                val authorizationWasPrepared = appOpsPropagationDelayMs != null
+                if (!(fallback == 0 && attempt == 1 && authorizationWasPrepared)) {
+                    reAssertAppOps()
+                    sendSilencePackets(500, defaultRemoteInet)
+                } else {
+                    Log.i(TAG, "Reusing prepared RECORD_AUDIO authorization for active capture")
+                }
 
                 for (cfg in configs) {
                     if (cfg.source in silentSourceIds) continue
@@ -503,6 +575,9 @@ class RtpSession(
         socket?.close()
         socket = null
         jitterBuffer.clear()
+        playbackReady.countDown()
+        captureStart.countDown()
+        synchronized(captureFrameLock) { captureFrameLock.notifyAll() }
 
         listener?.onRtpStopped()
     }
@@ -590,6 +665,10 @@ class RtpSession(
             try {
                 val read = record.read(pcmBuf, 0, pcmBuf.size)
                 if (read <= 0) continue
+                synchronized(captureFrameLock) {
+                    lastCaptureFrameElapsed = SystemClock.elapsedRealtime()
+                    captureFrameLock.notifyAll()
+                }
 
                 // Measure raw capture level BEFORE echo gate for diagnostics.
                 // If rawCaptureRms=0, the audio source itself is silent
@@ -763,14 +842,10 @@ class RtpSession(
                     firstRxInfo = "pt=${rtp.payloadType} len=${rtp.payload.size} hex=$hexHead"
                     Log.i(TAG, "First RX: $firstRxInfo")
                 }
-                // The SIP offer/answer is PCMA-only.  Ignore stray wideband
-                // packets instead of decoding them as 8 kHz A-law audio.
-                if (rtp.payloadType == RtpPacket.PT_PCMA) {
-                    if (!jitterBuffer.offer(rtp.payload)) {
-                        jitterBuffer.poll() // drop oldest
-                        jitterBuffer.offer(rtp.payload)
-                    }
-                }
+                // The SIP offer/answer is PCMA-only. The jitter buffer keeps
+                // sequence, timestamp and SSRC so burst and reorder handling
+                // does not depend on UDP arrival order.
+                jitterBuffer.offer(rtp)
             } catch (_: SocketTimeoutException) {
                 // normal
             } catch (e: Exception) {
@@ -821,16 +896,22 @@ class RtpSession(
                 } catch (_: Exception) { "" }
                 // CPU/memory/thread diagnostics
                 val cpuInfo = getCpuStats()
-                val stats = "tx=$txPacketCount rx=$rxPacketCount play=$playbackFrames " +
+                val jitterStats = jitterBuffer.stats()
+                val stats = "tx=$txPacketCount rx=$rxPacketCount writes=$playbackFrames " +
                         "capRMS=$captureRms rawCapRMS=$rawCaptureRms playRMS=$playbackRms src=$audioSourceName " +
-                        "rate=${captureRate}/${playbackRate} jbuf=${jitterBuffer.size} " +
+                        "rate=${captureRate}/${playbackRate} jbuf=${jitterStats.buffered} jitterMs=${jitterStats.jitterMs} " +
+                        "rtp:accepted=${jitterStats.accepted} played=${jitterStats.played} " +
+                        "concealed=${jitterStats.concealed} underrun=${jitterStats.underruns} " +
+                        "duplicate=${jitterStats.duplicate} reordered=${jitterStats.reordered} " +
+                        "late=${jitterStats.late} overflow=${jitterStats.overflow} " +
+                        "invalid=${jitterStats.invalid} resync=${jitterStats.resync} ssrc=${jitterStats.ssrcChanges} " +
                         "gates:echo=$echoGatedFrames noise=$noiseGatedFrames fwd=$forwardedFrames dt=$doubleTalkFrames echoG=${"%.2f".format(echoGainRatio)}" +
                         "$cpuInfo$volInfo" + extraInfo
                 Log.i(TAG, "RTP: $stats")
                 listener?.onRtpStats(stats)
 
                 val elapsed = System.currentTimeMillis() - lastRtpReceivedTime
-                if (elapsed > RTP_TIMEOUT_MS) {
+                if (signalingConnected && elapsed > RTP_TIMEOUT_MS) {
                     Log.w(TAG, "RTP timeout: no packets received for ${elapsed / 1000}s")
                     listener?.onRtpTimeout()
                     break
@@ -846,9 +927,6 @@ class RtpSession(
     private fun playbackLoop() {
         val track = audioTrack ?: return
 
-        // No prefill — the silence-frame loop below feeds the AudioTrack
-        // continuously, preventing underruns.  Removing the old 20ms prefill
-        // saves that much initial latency.
         track.play()
         Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true)")
 
@@ -863,6 +941,7 @@ class RtpSession(
         // already issues that command, and waiting for su -c was blocking
         // the playback thread for ~100ms.
         enableIncallMusicViaMixer()
+        playbackReady.countDown()
 
         // Silence frame for when jitter buffer is empty — prevents underruns
         // that cause BUFFER TIMEOUT and AudioTrack disable/restart cycles.
@@ -873,53 +952,47 @@ class RtpSession(
         // gets over-amplified causing distortion at the start of each phrase.
         // A short fade-in smooths the transition.
         var wasPlayingSilence = true
+        var lastDecodedFrame: ByteArray? = null
 
         while (running.get()) {
             try {
-                // Drain excess packets to bound latency.  When network
-                // jitter causes burst arrivals, the buffer can accumulate.
-                // Keep at most 5 (100ms) — enough headroom to absorb
-                // jitter without audible gaps.  100ms is still well within
-                // the GSM bridge's inherent latency budget.
-                while (jitterBuffer.size > 5) {
-                    jitterBuffer.poll()
-                }
-
-                val encoded = jitterBuffer.poll(18, TimeUnit.MILLISECONDS)
-                if (encoded == null) {
-                    // Write silence to keep AudioTrack fed and prevent underruns.
-                    track.write(silenceFrame, 0, silenceFrame.size)
-                    playbackRms = 0
-                    currentPlaybackActive = false
-                    wasPlayingSilence = true
-                    continue
-                }
-
-                // Decode based on codec.  G.722 outputs 16 kHz natively;
-                // PCMA always decodes to 8 kHz (playbackRate==8000).
-                val pcm = when (payloadType) {
-                    RtpPacket.PT_G722 -> g722Decoder.decodeToBytes(encoded)
-                    RtpPacket.PT_PCMA -> {
-                        if (playbackRate == 8000) PcmaCodec.decode8k(encoded)
-                        else PcmaCodec.decode(encoded)
+                val decision = jitterBuffer.poll()
+                val rawPcm = when (decision) {
+                    is RtpJitterBuffer.Playout.Packet -> {
+                        val decoded = when (payloadType) {
+                            RtpPacket.PT_G722 -> g722Decoder.decodeToBytes(decision.packet.payload)
+                            RtpPacket.PT_PCMA -> {
+                                if (playbackRate == 8000) PcmaCodec.decode8k(decision.packet.payload)
+                                else PcmaCodec.decode(decision.packet.payload)
+                            }
+                            else -> g722Decoder.decodeToBytes(decision.packet.payload)
+                        }
+                        if (wasPlayingSilence) applyFadeIn(decoded)
+                        wasPlayingSilence = false
+                        lastDecodedFrame = decoded.copyOf()
+                        decoded
                     }
-                    else -> g722Decoder.decodeToBytes(encoded)
-                }
-
-                // Fade-in after silence: prevents modem DSP AGC spike that
-                // causes distorted/harsh beginning of each agent phrase.
-                // 5ms ramp (40 samples @ 8kHz) is enough to smooth the onset.
-                if (wasPlayingSilence) {
-                    applyFadeIn(pcm)
-                    wasPlayingSilence = false
+                    RtpJitterBuffer.Playout.Missing -> {
+                        val hadPreviousFrame = lastDecodedFrame != null
+                        val concealed = concealPlaybackFrame(lastDecodedFrame, silenceFrame)
+                        lastDecodedFrame = concealed.copyOf()
+                        wasPlayingSilence = !hadPreviousFrame
+                        concealed
+                    }
+                    RtpJitterBuffer.Playout.Buffering -> {
+                        lastDecodedFrame = null
+                        wasPlayingSilence = true
+                        silenceFrame
+                    }
                 }
 
                 // Measure RMS BEFORE gain for the echo gate.  The echo gate
                 // threshold was calibrated to raw codec output levels.  If
                 // playbackGain > 1, measuring after gain would lower the
                 // effective threshold, over-suppressing caller speech.
-                val rawRms = pcmRms(pcm)
+                val rawRms = pcmRms(rawPcm)
                 currentPlaybackActive = rawRms > echoGateThreshold
+                val pcm = if (playbackGain > 1) rawPcm.copyOf() else rawPcm
 
                 // Software gain: boost PCM before writing to AudioTrack.
                 // This increases the digital level injected via incall_music
@@ -936,14 +1009,27 @@ class RtpSession(
                 }
 
                 playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
-                track.write(pcm, 0, pcm.size)
-                playbackFrames++
+                if (track.write(pcm, 0, pcm.size) > 0) playbackFrames++
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
                 if (running.get()) Log.e(TAG, "Playback error: ${e.message}")
             }
         }
+    }
+
+    private fun concealPlaybackFrame(previous: ByteArray?, silence: ByteArray): ByteArray {
+        if (previous == null || previous.size != silence.size) return silence
+        val concealed = previous.copyOf()
+        for (i in 0 until concealed.size / 2) {
+            val lo = concealed[i * 2].toInt() and 0xFF
+            val hi = concealed[i * 2 + 1].toInt()
+            val sample = (hi shl 8) or lo
+            val faded = (sample * 72 / 100).coerceIn(-32768, 32767)
+            concealed[i * 2] = (faded and 0xFF).toByte()
+            concealed[i * 2 + 1] = ((faded shr 8) and 0xFF).toByte()
+        }
+        return concealed
     }
 
     /**
@@ -1093,33 +1179,38 @@ class RtpSession(
      * discovered full path via [DeviceProfile.resolveCmd].
      */
     private fun enableIncallMusicViaMixer() {
+        Thread({ applyIncallMusicMixer() }, "RTP-Mixer").start()
+    }
+
+    /** Apply and verify the profile's injection mixer controls synchronously. */
+    private fun applyIncallMusicMixer(): Boolean {
         val mixerCmd = profile.mixerIncallMusicCmd
         if (mixerCmd.isEmpty()) {
             Log.i(TAG, "Mixer: no incall_music commands for ${profile.name}")
-            return
+            return true
         }
         val resolvedMixerCmd = DeviceProfile.resolveCmd(mixerCmd)
         if (resolvedMixerCmd.isEmpty()) {
             val msg = "Mixer: tinymix not found — cannot set incall_music mixer"
             Log.e(TAG, msg)
             listener?.onRtpStats(msg)
-            return
+            return false
         }
-        Thread({
-            try {
-                // Run device-specific mixer commands, then read back only
-                // controls that exist on the selected profile.
-                val stateCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
-                val cmd = "$resolvedMixerCmd; echo '=== mixer readback ==='; $stateCmd"
-                val output = RootShell.execForOutput(cmd, timeoutMs = 8000)
-                val msg = "Mixer incall_music: $output"
-                Log.i(TAG, msg)
-                listener?.onRtpStats(msg)
-            } catch (e: Exception) {
-                Log.w(TAG, "Mixer fallback failed: ${e.message}")
-                listener?.onRtpStats("Mixer incall_music FAILED: ${e.message}")
-            }
-        }, "RTP-Mixer").start()
+        return try {
+            // Run device-specific mixer commands, then read back only
+            // controls that exist on the selected profile.
+            val stateCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
+            val cmd = "$resolvedMixerCmd; echo '=== mixer readback ==='; $stateCmd"
+            val output = RootShell.execForOutput(cmd, timeoutMs = 8000)
+            val msg = "Mixer incall_music: $output"
+            Log.i(TAG, msg)
+            listener?.onRtpStats(msg)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Mixer fallback failed: ${e.message}")
+            listener?.onRtpStats("Mixer incall_music FAILED: ${e.message}")
+            false
+        }
     }
 
     /**

@@ -43,6 +43,15 @@ export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=10808 -Dhttps.pr
 ./build.sh release
 ```
 
+提交正式构建前，在同一编译服务器运行 JVM 单元测试：
+
+```bash
+./gradlew testReleaseUnitTest
+```
+
+测试覆盖 RTP 扩展头/填充解析、乱序、重复包、丢包、序列号回绕、SSRC 切换和
+缓冲溢出。当前发布版本应为 `2.8.64`（versionCode `342`）。
+
 Release APK 必须经过签名。当前私有设备构建使用编译机上固定的 Android debug
 keystore，便于后续版本使用同一签名升级；该签名不适合公开发行。
 
@@ -138,6 +147,8 @@ adb -s 192.168.2.82:5555 shell \
 - 使用 SDM845/Tavil 对应的 mixer 诊断，而不是 Samsung ABOX 控件
 
 最终仍需通过一次真实 GSM 与 SIP 双向通话验证上下行声音、增益和回声参数。
+RTP 排序、丢包补偿和验收指标见
+[RTP-AND-MEDIA-READINESS.md](RTP-AND-MEDIA-READINESS.md)。
 
 ## 6. PackageManager 旧缓存
 

@@ -2,6 +2,7 @@ package com.callagent.gateway.bridge
 
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.telecom.Call
 import android.util.Log
 import com.callagent.gateway.RootShell
@@ -46,6 +47,13 @@ class CallOrchestrator(
     @Volatile private var gsmActiveHandled = false
     @Volatile private var diallerInitiated = false
     @Volatile private var lastStateChangeTime = 0L
+    @Volatile private var lastGsmActiveElapsed = 0L
+    @Volatile private var outboundRtpPreparationStarted = false
+    @Volatile private var recordAudioAuthorizedElapsed = 0L
+    @Volatile private var recordAudioAuthorizationInProgress = false
+    private val recordAudioAuthorizationLock = Object()
+    private var pendingOutboundLocalRtpPort = 0
+    private var activeRtpEndpointKey: String? = null
 
     // Pending RTP info: saved when SIP answers before GSM is picked up.
     // onGsmCallActive reads these to start RTP immediately after GSM pickup.
@@ -116,6 +124,7 @@ class CallOrchestrator(
         lastStateChangeTime = System.currentTimeMillis()
         bridgeState = BridgeState.GSM_DIALING
         listener?.onStateChanged(bridgeState, "Dialing $number")
+        beginRecordAudioAuthorization()
         if (!GsmCallManager.makeCall(context, number)) {
             tearDown("GSM dial unavailable")
             return
@@ -212,6 +221,7 @@ class CallOrchestrator(
 
         sipCallRetries = 0
         gsmActiveHandled = false
+        beginRecordAudioAuthorization()
         bridgeState = BridgeState.GSM_RINGING
         activeGsmCall = call
         listener?.onStateChanged(bridgeState, "GSM call from $number")
@@ -233,6 +243,7 @@ class CallOrchestrator(
         }
         gsmActiveHandled = true
         activeGsmCall = call
+        lastGsmActiveElapsed = SystemClock.elapsedRealtime()
 
         when (bridgeState) {
             BridgeState.SIP_CALLING, BridgeState.SIP_RINGING -> {
@@ -247,7 +258,7 @@ class CallOrchestrator(
 
                 if (addr != null && port > 0) {
                     Thread({
-                        if (!startRtp(localPort, addr, port, pt)) {
+                        if (!startRtp(localPort, addr, port, pt, lastGsmActiveElapsed)) {
                             tearDown("RTP setup failed")
                             return@Thread
                         }
@@ -288,7 +299,8 @@ class CallOrchestrator(
                             tearDown("SIP call disappeared")
                             return@Thread
                         }
-                        val rtpPort = allocateRtpPort()
+                        val rtpPort = pendingOutboundLocalRtpPort.takeIf { it > 0 }
+                            ?: allocateRtpPort()
                         sipCall.listener = this
                         val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
                         val port = sipCall.remoteRtpPort
@@ -301,7 +313,7 @@ class CallOrchestrator(
                         }
 
                         Log.i(TAG, "GSM answered — preparing RTP before SIP 200 OK")
-                        if (!startRtp(rtpPort, addr, port, pt)) {
+                        if (!startRtp(rtpPort, addr, port, pt, lastGsmActiveElapsed)) {
                             tearDown("RTP setup failed")
                             return@Thread
                         }
@@ -312,7 +324,7 @@ class CallOrchestrator(
                             return@Thread
                         }
 
-                        sipCall.accept(rtpPort)
+                        sipCall.accept(rtpPort, mediaReady = true)
                         bridgeState = BridgeState.BRIDGED
                         listener?.onStateChanged(bridgeState, "Bridged (outbound)")
                         Log.i(TAG, "Outbound bridge established with media ready")
@@ -341,6 +353,10 @@ class CallOrchestrator(
 
         if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE) {
             tearDown("GSM call disconnected")
+        }
+        if ((state == Call.STATE_DIALING || state == Call.STATE_CONNECTING)
+            && bridgeState == BridgeState.GSM_DIALING && !diallerInitiated) {
+            startOutboundRtpPreparationIfNeeded()
         }
     }
 
@@ -382,7 +398,13 @@ class CallOrchestrator(
                 Log.i(TAG, "SIP answered (codec=$codecName) — GSM already active, starting RTP now")
                 val localRtpPort = call.localRtpPort
                 Thread({
-                    if (!startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)) {
+                    if (!startRtp(
+                            localRtpPort,
+                            remoteRtpAddr,
+                            remoteRtpPort,
+                            payloadType,
+                            lastGsmActiveElapsed
+                        )) {
                         tearDown("RTP setup failed")
                         return@Thread
                     }
@@ -411,7 +433,13 @@ class CallOrchestrator(
             // Edge case: GSM was already answered (e.g. user picked up manually)
             // before SIP was ready.  Start RTP now.
             val localRtpPort = call.localRtpPort
-            if (!startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)) {
+            if (!startRtp(
+                    localRtpPort,
+                    remoteRtpAddr,
+                    remoteRtpPort,
+                    payloadType,
+                    lastGsmActiveElapsed
+                )) {
                 tearDown("RTP setup failed")
                 return
             }
@@ -464,7 +492,10 @@ class CallOrchestrator(
         bridgeState = BridgeState.GSM_DIALING
         activeSipCall = sipCall
         gsmActiveHandled = false
+        outboundRtpPreparationStarted = false
+        pendingOutboundLocalRtpPort = allocateRtpPort()
         listener?.onStateChanged(bridgeState, "Dialing $gsmDestination")
+        beginRecordAudioAuthorization()
 
         // Send 180 Ringing to SIP caller while GSM dials
         sipCall.originalInvite?.let { invite ->
@@ -493,18 +524,70 @@ class CallOrchestrator(
 
     // ── RTP ─────────────────────────────────────────────
 
-    private fun startRtp(localPort: Int, remoteAddr: String, remotePort: Int,
-                         payloadType: Int = RtpPacket.PT_PCMA): Boolean {
-        // Re-assert RECORD_AUDIO appops SYNCHRONOUSLY before AudioRecord
-        // creation.  Must complete before RtpSession.start() so AudioFlinger
-        // sees "allow" when the record thread begins reading.  Running async
-        // caused a race: AudioRecord started reading silence (denied) before
-        // the appops command finished.  RtpSession also periodically re-asserts
-        // appops in its timeoutLoop for screen-off resilience.
-        forceAllowRecordAudio()
+    private fun startOutboundRtpPreparationIfNeeded() {
+        val sipCall: SipCall
+        val localPort: Int
+        synchronized(this) {
+            if (outboundRtpPreparationStarted) return
+            sipCall = activeSipCall ?: return
+            localPort = pendingOutboundLocalRtpPort.takeIf { it > 0 } ?: return
+            if (sipCall.remoteRtpPort <= 0 || sipCall.negotiatedPayloadType < 0) return
+            outboundRtpPreparationStarted = true
+        }
+
+        val remoteAddr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
+        Log.i(
+            TAG,
+            "Prewarming outbound RTP while GSM is dialing: " +
+                "$localPort -> $remoteAddr:${sipCall.remoteRtpPort}"
+        )
+        Thread({
+            if (!startRtp(
+                    localPort,
+                    remoteAddr,
+                    sipCall.remoteRtpPort,
+                    sipCall.negotiatedPayloadType,
+                    captureAfterElapsed = null
+                ) && activeSipCall === sipCall && bridgeState == BridgeState.GSM_DIALING) {
+                tearDown("RTP prewarm failed")
+            }
+        }, "RTP-Prewarm").start()
+    }
+
+    @Synchronized
+    private fun startRtp(
+        localPort: Int,
+        remoteAddr: String,
+        remotePort: Int,
+        payloadType: Int = RtpPacket.PT_PCMA,
+        captureAfterElapsed: Long? = null
+    ): Boolean {
+        val endpointKey = "$localPort|$remoteAddr|$remotePort|$payloadType"
+        val existing = activeRtpSession
+        if (existing != null && activeRtpEndpointKey == endpointKey) {
+            Log.i(TAG, "Reusing prewarmed RTP session for $remoteAddr:$remotePort")
+            if (captureAfterElapsed != null && captureAfterElapsed > 0L) {
+                if (!existing.awaitMediaReady(captureAfterElapsed, MEDIA_READY_TIMEOUT_MS)) {
+                    existing.stop()
+                    if (activeRtpSession === existing) {
+                        activeRtpSession = null
+                        activeRtpEndpointKey = null
+                    }
+                    return false
+                }
+                existing.markSignalingConnected()
+            }
+            return true
+        }
 
         activeRtpSession?.stop()
-        val session = RtpSession(context, localPort, remoteAddr, remotePort, payloadType)
+        activeRtpSession = null
+        activeRtpEndpointKey = null
+        val propagationDelay = prepareRecordAudioForRtp()
+        val session = RtpSession(
+            context, localPort, remoteAddr, remotePort, payloadType,
+            appOpsPropagationDelayMs = propagationDelay
+        )
         session.listener = object : RtpSession.Listener {
             override fun onRtpStarted() {
                 Log.i(TAG, "RTP session started")
@@ -525,14 +608,32 @@ class CallOrchestrator(
             }
         }
         activeRtpSession = session
+        activeRtpEndpointKey = endpointKey
         if (!session.start()) {
-            if (activeRtpSession === session) activeRtpSession = null
+            if (activeRtpSession === session) {
+                activeRtpSession = null
+                activeRtpEndpointKey = null
+            }
             return false
         }
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) {
             session.stop()
-            if (activeRtpSession === session) activeRtpSession = null
+            if (activeRtpSession === session) {
+                activeRtpSession = null
+                activeRtpEndpointKey = null
+            }
             return false
+        }
+        if (captureAfterElapsed != null && captureAfterElapsed > 0L) {
+            if (!session.awaitMediaReady(captureAfterElapsed, MEDIA_READY_TIMEOUT_MS)) {
+                session.stop()
+                if (activeRtpSession === session) {
+                    activeRtpSession = null
+                    activeRtpEndpointKey = null
+                }
+                return false
+            }
+            session.markSignalingConnected()
         }
         return true
     }
@@ -550,6 +651,7 @@ class CallOrchestrator(
         try {
             activeRtpSession?.stop()
             activeRtpSession = null
+            activeRtpEndpointKey = null
 
             activeSipCall?.let {
                 try {
@@ -577,6 +679,9 @@ class CallOrchestrator(
             pendingRtpPort = 0
             pendingPayloadType = 0
             pendingLocalRtpPort = 0
+            pendingOutboundLocalRtpPort = 0
+            outboundRtpPreparationStarted = false
+            lastGsmActiveElapsed = 0L
         } finally {
             bridgeState = BridgeState.IDLE
             lastStateChangeTime = System.currentTimeMillis()
@@ -631,6 +736,54 @@ class CallOrchestrator(
         }, "GSM-Dial-Timeout").start()
     }
 
+    /** Start the root authorization while the call is still ringing/dialing. */
+    private fun beginRecordAudioAuthorization() {
+        synchronized(recordAudioAuthorizationLock) {
+            if (recordAudioAuthorizationInProgress) return
+            // Re-authorize once per call. Android may revoke the UID AppOp
+            // between two calls even when the previous grant is recent.
+            recordAudioAuthorizedElapsed = 0L
+            recordAudioAuthorizationInProgress = true
+        }
+
+        Thread({
+            val allowed = forceAllowRecordAudio()
+            synchronized(recordAudioAuthorizationLock) {
+                recordAudioAuthorizedElapsed =
+                    if (allowed) SystemClock.elapsedRealtime() else 0L
+                recordAudioAuthorizationInProgress = false
+                recordAudioAuthorizationLock.notifyAll()
+            }
+            Log.i(TAG, "RECORD_AUDIO preauthorization complete: allowed=$allowed")
+        }, "RecordAudio-Prepare").start()
+    }
+
+    /**
+     * Return only the unelapsed AppOps propagation time. If the early request
+     * failed or became stale, let RtpSession issue a fresh request itself.
+     */
+    private fun prepareRecordAudioForRtp(): Long? {
+        synchronized(recordAudioAuthorizationLock) {
+            val waitDeadline = SystemClock.elapsedRealtime() + RECORD_AUDIO_AUTH_WAIT_MS
+            while (recordAudioAuthorizationInProgress) {
+                val remaining = waitDeadline - SystemClock.elapsedRealtime()
+                if (remaining <= 0L) break
+                try {
+                    recordAudioAuthorizationLock.wait(remaining)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return null
+                }
+            }
+
+            val age = SystemClock.elapsedRealtime() - recordAudioAuthorizedElapsed
+            if (recordAudioAuthorizedElapsed > 0L && age < RECORD_AUDIO_AUTH_FRESH_MS) {
+                return (GsmCallManager.profile.appopsPropagationMs - age).coerceAtLeast(0L)
+            }
+        }
+        return null
+    }
+
     /**
      * Force-allow RECORD_AUDIO via appops using root (Magisk).
      *
@@ -643,7 +796,7 @@ class CallOrchestrator(
      * the UID mode (set by PermissionController).  UID mode overrides
      * package mode, so without --uid the allow is ineffective on cold boot.
      */
-    private fun forceAllowRecordAudio() {
+    private fun forceAllowRecordAudio(): Boolean {
         try {
             val pkg = context.packageName
             val t0 = System.currentTimeMillis()
@@ -674,11 +827,14 @@ class CallOrchestrator(
                     "cmd appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
                 )
                 Log.w(TAG, "appops fallback cmd: [$fb]")
+                return fb.contains("allow", ignoreCase = true)
             } else {
                 Log.d(TAG, "appops RECORD_AUDIO verified: allow")
+                return true
             }
         } catch (e: Exception) {
             Log.w(TAG, "appops force-allow failed: ${e.message}")
+            return false
         }
     }
 
@@ -691,6 +847,7 @@ class CallOrchestrator(
             activeRtpSession?.stop()
         } catch (_: Exception) {}
         activeRtpSession = null
+        activeRtpEndpointKey = null
         try {
             activeSipCall?.let {
                 if (it.state != SipCall.State.TERMINATED) it.hangup()
@@ -707,6 +864,9 @@ class CallOrchestrator(
         pendingRtpPort = 0
         pendingPayloadType = 0
         pendingLocalRtpPort = 0
+        pendingOutboundLocalRtpPort = 0
+        outboundRtpPreparationStarted = false
+        lastGsmActiveElapsed = 0L
         diallerInitiated = false
         bridgeState = BridgeState.IDLE
         lastStateChangeTime = System.currentTimeMillis()
@@ -718,6 +878,9 @@ class CallOrchestrator(
         private const val TAG = "CallOrchestrator"
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
         private const val GSM_DIAL_TIMEOUT_MS = 45_000L
+        private const val MEDIA_READY_TIMEOUT_MS = 3_000L
+        private const val RECORD_AUDIO_AUTH_WAIT_MS = 3_000L
+        private const val RECORD_AUDIO_AUTH_FRESH_MS = 60_000L
         /** If bridge is non-IDLE for this long, consider it stale */
         private const val STALE_STATE_TIMEOUT_MS = 60_000L
     }
