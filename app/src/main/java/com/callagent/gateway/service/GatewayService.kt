@@ -199,22 +199,28 @@ class GatewayService : Service() {
     }
 
     private fun startGateway(intent: Intent?) {
-        // Guard: if the gateway is already running (SIP client exists and
-        // we're not in stopped state), don't tear it down and restart.
+        // Guard: if the gateway is already running or still initializing,
+        // don't tear it down and restart.
         // This prevents redundant ACTION_START intents (e.g. from the
         // Activity opening, START_STICKY restart, or BootReceiver) from
-        // killing an active SIP registration or call bridge.
-        if (!stopped && sipClient != null) {
-            Log.i(TAG, "startGateway: already running, skipping restart")
+        // creating competing SIP clients on the same local port.
+        val initInProgress = initializing.get()
+        if (!stopped && (sipClient != null || initInProgress)) {
+            Log.i(TAG, "startGateway: already running or initializing, skipping restart")
             // Broadcast current state so the Activity picks up the live status
             val state = orchestrator?.bridgeState ?: CallOrchestrator.BridgeState.IDLE
             val registered = sipClient?.registered == true
-            val info = when (state) {
-                CallOrchestrator.BridgeState.IDLE ->
-                    if (registered) "SIP registered" else "Connected"
-                else -> state.name
+            val status = if (initInProgress) "STARTING" else state.name
+            val info = if (initInProgress) {
+                "Connecting"
+            } else {
+                when (state) {
+                    CallOrchestrator.BridgeState.IDLE ->
+                        if (registered) "SIP registered" else "Connected"
+                    else -> state.name
+                }
             }
-            broadcastStatus(state.name, info)
+            broadcastStatus(status, info)
             return
         }
 
