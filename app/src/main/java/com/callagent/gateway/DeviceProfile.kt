@@ -246,27 +246,66 @@ data class DeviceProfile(
         fun sdm845Dipper() = DeviceProfile(
             name = "Xiaomi Mi 8 (SDM845/Tavil)",
             mixerSetupCmd = buildString {
+                // AudioTrack uses the deep-buffer output (PCM0/MultiMedia1).
+                // Open its modem uplink route before playback starts so media
+                // initialization cannot race the later RTP mixer setup.
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                // Keep MultiMedia2 available for vendor policy variants.
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                // Keep the digital modem uplink open, but disconnect every
+                // physical handset/speaker microphone frontend.  MI8 uses
+                // TX7/TX8 for the active dual-mic call route; TX6 covers the
+                // single-mic speaker variant.
+                append("tinymix 'CDC_IF TX6 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'CDC_IF TX7 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'CDC_IF TX8 MUX' 'ZERO' 2>/dev/null; ")
+                // MultiMedia1 must remain connected to Incall_Music, but it
+                // does not need a physical receiver/speaker render path.
+                append("tinymix 'QUAT_MI2S_RX Audio Mixer MultiMedia1' 0 2>/dev/null; ")
                 // Mute the physical voice endpoint after the modem capture
                 // tap, while keeping the digital uplink injection open.
                 append("tinymix 'Voice Rx Device Mute' 1 2>/dev/null; ")
                 append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
             },
             mixerRestoreCmd = buildString {
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 0 2>/dev/null; ")
+                append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia1' 0 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
                 append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 0 2>/dev/null; ")
+                // Leave codec TX disconnected.  Audio HAL selects and opens
+                // the correct route for the next ordinary call.
+                append("tinymix 'CDC_IF TX6 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'CDC_IF TX7 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'CDC_IF TX8 MUX' 'ZERO' 2>/dev/null; ")
                 append("tinymix 'Voice Rx Device Mute' 0 2>/dev/null; ")
                 append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
             },
             mixerIncallMusicCmd = buildString {
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia1' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 1 2>/dev/null; ")
                 append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
-                append("echo -n 'SIM1_INCALL='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>/dev/null; ")
-                append("echo -n 'SIM2_INCALL='; tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 2>/dev/null")
+                // Re-assert after AudioTrack.play() and GSM ACTIVE because
+                // the HAL may rebuild both the mic and local playback paths.
+                append("tinymix 'CDC_IF TX6 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'CDC_IF TX7 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'CDC_IF TX8 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'QUAT_MI2S_RX Audio Mixer MultiMedia1' 0 2>/dev/null; ")
+                append("echo -n 'SIM1_MM1='; tinymix 'Incall_Music Audio Mixer MultiMedia1' 2>/dev/null; ")
+                append("echo -n 'SIM1_MM2='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>/dev/null; ")
+                append("echo -n 'SIM2_MM1='; tinymix 'Incall_Music_2 Audio Mixer MultiMedia1' 2>/dev/null; ")
+                append("echo -n 'SIM2_MM2='; tinymix 'Incall_Music_2 Audio Mixer MultiMedia2' 2>/dev/null; ")
+                append("echo -n 'MIC_TX6='; tinymix 'CDC_IF TX6 MUX' 2>/dev/null; ")
+                append("echo -n 'MIC_TX7='; tinymix 'CDC_IF TX7 MUX' 2>/dev/null; ")
+                append("echo -n 'MIC_TX8='; tinymix 'CDC_IF TX8 MUX' 2>/dev/null; ")
+                append("echo -n 'LOCAL_MM1='; tinymix 'QUAT_MI2S_RX Audio Mixer MultiMedia1' 2>/dev/null")
             },
             mixerDiagGrep = buildString {
                 append("tinymix 2>&1 | grep -iE ")
-                append("'(Incall_Music|VOC_REC_(UL|DL)|Voice.*Mute|VoiceMMode[12])'")
+                append("'(Incall_Music|VOC_REC_(UL|DL)|Voice.*Mute|VoiceMMode[12]|CDC_IF TX[678] MUX|QUAT_MI2S_RX Audio Mixer MultiMedia1)'")
             },
             musicVolPercent = 25,
             captureGain = 2,

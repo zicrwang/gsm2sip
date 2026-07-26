@@ -50,7 +50,7 @@ export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=10808 -Dhttps.pr
 ```
 
 测试覆盖 RTP 扩展头/填充解析、乱序、重复包、丢包、序列号回绕、SSRC 切换和
-缓冲溢出。当前发布版本应为 `2.8.64`（versionCode `342`）。
+缓冲溢出。当前发布版本应为 `2.8.66`（versionCode `344`）。
 
 Release APK 必须经过签名。当前私有设备构建使用编译机上固定的 Android debug
 keystore，便于后续版本使用同一签名升级；该签名不适合公开发行。
@@ -140,7 +140,15 @@ adb -s 192.168.2.82:5555 shell \
 
 `DeviceProfile.sdm845Dipper()` 会在 `Build.DEVICE=dipper` 时启用。该配置：
 
-- 同时控制 SIM1 和 SIM2 的 `Incall_Music ... MultiMedia2`
+- 在音频播放开始前同时打开 SIM1 和 SIM2 的
+  `Incall_Music ... MultiMedia1`；当前 `deep_buffer` 音轨实际使用
+  PCM0/MultiMedia1，并同时保留 MultiMedia2 以兼容不同音频策略
+- 通话结束时关闭两个卡槽的 MultiMedia1/MultiMedia2，避免残留混音路由
+- 桥接时将 `CDC_IF TX6/TX7/TX8 MUX` 置为 `ZERO`，只断开 Tavil
+  物理麦克风前端，不使用会同时切断 incall_music 的全局 `Voice Tx Mute`
+- 保留 MultiMedia1 到 incall_music 的数字支路，同时关闭
+  `QUAT_MI2S_RX Audio Mixer MultiMedia1`，避免注入音频在 MI8 本机播放后
+  再被任何残留麦克风声学回采
 - 优先尝试 `VOICE_DOWNLINK` 和 `VOICE_CALL` 数字通话录音源
 - 失败或静音时回退到 `VOICE_RECOGNITION`、`MIC` 和
   `VOICE_COMMUNICATION`

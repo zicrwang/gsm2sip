@@ -137,6 +137,11 @@ GSM dial timeout
 增长表示 CallAgent 正在发送音频。干净局域网中 `overflow` 应为 0，补偿和欠载
 应接近 0。
 
+MI8 的 `USAGE_MEDIA` 音轨通过 `deep_buffer` 落到 PCM0/MultiMedia1。通话中应确认
+`Incall_Music Audio Mixer MultiMedia1` 或
+`Incall_Music_2 Audio Mixer MultiMedia1` 已为 `On`；只打开 MultiMedia2 会导致
+播放缓冲持续溢出，并伴随 `pcm_prepare`、`ADSP_EFAILED` 或 ASoC prepare 错误。
+
 ### Contact 或 SDP 使用错误地址
 
 不要把模拟器内部 IP 手动写入 Asterisk。应配置模拟器 UDP 5060/5062 和 RTP 端口映射，并让 Asterisk 使用实际收到的源地址。CallAgent 调试页的 `Local IP` 应显示 `192.168.188.2`，而不是 `192.168.2.82` 或 `192.168.111.98`。
@@ -153,18 +158,20 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-70bf74c2bfe2d9da1e381fa1911c3eca81a997798f279dcda9485cf283e350c3
+aded85abcab64ed09211ee679261614cb59c008845cea0cd841b31f86b63f286
 
 gateway-magisk.zip
-386f57310e1cf433f3b1ef4fa1cb996a000cf965c44e25ebe85883488c31276e
+34a287344e9cfe4006614e0d5bcb7daf1aba05db36454986cc59743e4e3d6d99
 ```
 
-APK 版本应为 `2.8.64`（versionCode `342`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.66`（versionCode `344`），并通过 APK Signature Scheme
 v2 验证。
 
-v2.8.64 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
-incall_music 数字注入，并在桥接期间静音物理 Voice RX endpoint；挂断后
-恢复 mixer。SIP 200 OK 前必须完成 GSM ACTIVE、RTP socket、播放线程和捕获帧
+v2.8.66 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+incall_music 数字注入；桥接期间断开 `CDC_IF TX6/TX7/TX8` 物理麦克风前端，
+并关闭 MultiMedia1 到本机 QUAT 接收器/扬声器的渲染支路。`Voice Tx Mute`
+保持关闭，因此数字注入不会随全局蜂窝 TX 一起被静音。SIP 200 OK 前必须完成
+GSM ACTIVE、RTP socket、播放线程和捕获帧
 就绪；重复启动请求在首次初始化完成前会被忽略。RTP 接收新增序列号回绕、
 乱序/重复/迟到处理、有界抖动缓冲和短时丢包衰减补偿；启动 NAT priming 使用
 有效的 PCMA A-law 静音并推进 RTP 序列号和时间戳。

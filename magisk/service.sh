@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# service.sh — runs late in boot (after data is decrypted & mounted)
+# service.sh — KernelSU may start this before Android's framework is ready.
 #
 # Keeps the priv-app APK in sync when the user updates via 'adb install -r'.
 # The updated APK goes to /data/app/ but the priv-app base in the Magisk
@@ -10,6 +10,7 @@
 
 MODDIR="${0%/*}"
 TAG="GatewayMagisk"
+PKG="com.callagent.gateway"
 
 MOD_VER=$(grep '^version=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2)
 log -t "$TAG" "SIP-GSM Gateway Magisk Module ${MOD_VER:-unknown} — service.sh running"
@@ -17,9 +18,33 @@ log -t "$TAG" "SIP-GSM Gateway Magisk Module ${MOD_VER:-unknown} — service.sh 
 PRIV_DIR="$MODDIR/system/priv-app/Gateway"
 PRIV_APK="$PRIV_DIR/Gateway.apk"
 
+# KernelSU service scripts can run before PackageManager has scanned the
+# mounted priv-app.  Use bounded waits so APK sync, grants and diagnostics do
+# not produce false failures, while still allowing boot to finish if Android
+# services never become ready.
+WAITED=0
+while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ] && [ "$WAITED" -lt 90 ]; do
+    sleep 2
+    WAITED=$((WAITED + 2))
+done
+if [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
+    log -t "$TAG" "Android framework ready after ${WAITED}s"
+else
+    log -t "$TAG" "Android framework wait timed out after ${WAITED}s; continuing"
+fi
+
 # ── Sync APK ──────────────────────────────────────────
 # pm path returns the currently-active APK (may be /data/app/ update)
-APK_PATH=$(pm path com.callagent.gateway 2>/dev/null | head -1 | sed 's/^package://')
+APK_PATH=""
+WAITED=0
+while [ "$WAITED" -lt 30 ]; do
+    APK_PATH=$(pm path "$PKG" 2>/dev/null | head -1 | sed 's/^package://')
+    if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+        break
+    fi
+    sleep 2
+    WAITED=$((WAITED + 2))
+done
 
 if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
     if [ ! -f "$PRIV_APK" ]; then
@@ -43,7 +68,6 @@ fi
 # ── Grant runtime permissions automatically ───────────
 # These normally require user approval via UI prompts.
 # Granting them here avoids manual setup on a headless gateway.
-PKG="com.callagent.gateway"
 for PERM in \
     android.permission.RECORD_AUDIO \
     android.permission.READ_PHONE_STATE \
