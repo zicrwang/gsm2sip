@@ -92,6 +92,7 @@ class RtpSession(
     @Volatile private var firstTxInfo = ""
     @Volatile private var lastCaptureFrameElapsed = 0L
     @Volatile private var signalingConnected = false
+    private val captureDiagnosticsStarted = AtomicBoolean(false)
     private val captureFrameLock = Object()
     private val playbackReady = CountDownLatch(1)
     private val captureStart = CountDownLatch(1)
@@ -224,6 +225,7 @@ class RtpSession(
         captureStart.countDown()
         signalingConnected = true
         lastRtpReceivedTime = System.currentTimeMillis()
+        maybeStartCaptureDiagnostics()
     }
 
     /**
@@ -307,9 +309,7 @@ class RtpSession(
             audioRecord = record
             audioSessionId = record.audioSessionId
             captureRate = usedRate
-
-            // Diagnostic: check critical permissions and ABOX state
-            logCaptureDiagnostics(record)
+            maybeStartCaptureDiagnostics()
         }
 
         // Minimum buffer for lowest latency.  incall_music injects
@@ -462,6 +462,7 @@ class RtpSession(
                             audioSourceName = cfg.name
                             currentSourceId = cfg.source
                             Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize, fallback=$fallback attempt=$attempt)")
+                            maybeStartCaptureDiagnostics()
                             sourceFound = true
                             break
                         } else {
@@ -1286,6 +1287,15 @@ class RtpSession(
      * Phase 6: Delayed NSRC re-check (t+5s)
      * Phase 7: ALSA capture PCM probe (tinycap, if available)
      */
+    private fun maybeStartCaptureDiagnostics() {
+        if (!signalingConnected) return
+        val record = audioRecord ?: return
+        if (captureDiagnosticsStarted.compareAndSet(false, true)) {
+            Log.i(TAG, "Starting capture diagnostics after SIP signaling connected")
+            logCaptureDiagnostics(record)
+        }
+    }
+
     private fun logCaptureDiagnostics(record: AudioRecord) {
         try {
             // Check CAPTURE_AUDIO_OUTPUT (system permission, not runtime)

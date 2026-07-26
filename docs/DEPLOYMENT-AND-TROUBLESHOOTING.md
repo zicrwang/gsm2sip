@@ -158,16 +158,16 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-cb09bfab2a2ece0a2f06b9d92b80204038b14e7b378beed42c155eaa01941508
+b3dbfa1fc16874444ef63d18da639c7853a263711d402645cc08bc7de626f44a
 
 gateway-magisk.zip
-ac11bb7442dc941cfd47f5c77ee9317786c705d5c67972430482018dec035cf1
+531d390b16a6b6e68c18f4f4b73656c0d77f23d3e9eddf12d178483f25e7ecbe
 ```
 
-APK 版本应为 `2.8.67`（versionCode `345`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.68`（versionCode `346`），并通过 APK Signature Scheme
 v2 验证。
 
-v2.8.67 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+v2.8.68 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
 incall_music 数字注入；桥接期间断开 `CDC_IF TX6/TX7/TX8` 物理麦克风前端，
 并关闭 MultiMedia1 到本机 QUAT 接收器/扬声器的渲染支路。`Voice Tx Mute`
 保持关闭，因此数字注入不会随全局蜂窝 TX 一起被静音。SIP 200 OK 前必须完成
@@ -175,7 +175,8 @@ GSM ACTIVE、RTP socket、播放线程和捕获帧
 就绪；重复启动请求在首次初始化完成前会被忽略。RTP 接收新增序列号回绕、
 乱序/重复/迟到处理、有界抖动缓冲和短时丢包衰减补偿；启动 NAT priming 使用
 有效的 PCMA A-law 静音并推进 RTP 序列号和时间戳。外拨媒体在 GSM 振铃阶段主动
-预热，ACTIVE 后的关键路径不再执行全量 mixer dump；GSM/SIP 超时绑定通话代次，
+预热，ACTIVE 后的关键路径不再执行全量 mixer dump，耗时 root 诊断延后到 SIP
+接通之后；GSM/SIP 超时绑定通话代次，
 旧通话的计时器不会中断下一次快速重拨。
 
 ## 7. 仍需在设备端完成的事项
