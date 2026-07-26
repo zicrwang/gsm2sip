@@ -61,6 +61,7 @@ class CallOrchestrator(
     private var pendingRtpAddr: String? = null
     private var pendingRtpPort: Int = 0
     private var pendingPayloadType: Int = 0
+    private var pendingTelephoneEventPayloadType: Int? = null
     private var pendingLocalRtpPort: Int = 0
 
     // SIP call retry: if SIP fails while GSM is ringing, retry before giving up.
@@ -258,12 +259,20 @@ class CallOrchestrator(
                 val addr = pendingRtpAddr
                 val port = pendingRtpPort
                 val pt = pendingPayloadType
+                val telephoneEventPt = pendingTelephoneEventPayloadType
                 val localPort = pendingLocalRtpPort
                 pendingRtpAddr = null
 
                 if (addr != null && port > 0) {
                     Thread({
-                        if (!startRtp(localPort, addr, port, pt, lastGsmActiveElapsed)) {
+                        if (!startRtp(
+                                localPort,
+                                addr,
+                                port,
+                                pt,
+                                telephoneEventPt,
+                                lastGsmActiveElapsed,
+                            )) {
                             tearDown("RTP setup failed")
                             return@Thread
                         }
@@ -320,7 +329,14 @@ class CallOrchestrator(
                         }
 
                         Log.i(TAG, "GSM answered — preparing RTP before SIP 200 OK")
-                        if (!startRtp(rtpPort, addr, port, pt, lastGsmActiveElapsed)) {
+                        if (!startRtp(
+                                rtpPort,
+                                addr,
+                                port,
+                                pt,
+                                sipCall.negotiatedTelephoneEventPayloadType,
+                                lastGsmActiveElapsed,
+                            )) {
                             tearDown("RTP setup failed")
                             return@Thread
                         }
@@ -416,6 +432,7 @@ class CallOrchestrator(
                             remoteRtpAddr,
                             remoteRtpPort,
                             payloadType,
+                            call.negotiatedTelephoneEventPayloadType,
                             lastGsmActiveElapsed
                         )) {
                         tearDown("RTP setup failed")
@@ -437,6 +454,7 @@ class CallOrchestrator(
                 pendingRtpAddr = remoteRtpAddr
                 pendingRtpPort = remoteRtpPort
                 pendingPayloadType = payloadType
+                pendingTelephoneEventPayloadType = call.negotiatedTelephoneEventPayloadType
                 pendingLocalRtpPort = call.localRtpPort
 
                 Log.i(TAG, "SIP answered (codec=$codecName) — answering GSM call now")
@@ -452,6 +470,7 @@ class CallOrchestrator(
                     remoteRtpAddr,
                     remoteRtpPort,
                     payloadType,
+                    call.negotiatedTelephoneEventPayloadType,
                     lastGsmActiveElapsed
                 )) {
                 tearDown("RTP setup failed")
@@ -576,13 +595,18 @@ class CallOrchestrator(
         )
         Thread({
             if (!callAttempts.isCurrent(attemptToken) || activeSipCall !== sipCall) return@Thread
-            if (!startRtp(
+            val started = startRtp(
                     localPort,
                     remoteAddr,
                     sipCall.remoteRtpPort,
                     sipCall.negotiatedPayloadType,
+                    sipCall.negotiatedTelephoneEventPayloadType,
                     captureAfterElapsed = null
-                ) && callAttempts.isCurrent(attemptToken) &&
+                )
+            if (started && callAttempts.isCurrent(attemptToken) &&
+                activeSipCall === sipCall && bridgeState == BridgeState.GSM_DIALING) {
+                sipCall.sendEarlyMedia(localPort)
+            } else if (!started && callAttempts.isCurrent(attemptToken) &&
                 activeSipCall === sipCall && bridgeState == BridgeState.GSM_DIALING) {
                 tearDown("RTP prewarm failed")
             }
@@ -595,14 +619,15 @@ class CallOrchestrator(
         remoteAddr: String,
         remotePort: Int,
         payloadType: Int = RtpPacket.PT_PCMA,
+        telephoneEventPayloadType: Int? = null,
         captureAfterElapsed: Long? = null
     ): Boolean {
-        val endpointKey = "$localPort|$remoteAddr|$remotePort|$payloadType"
+        val endpointKey = "$localPort|$remoteAddr|$remotePort|$payloadType|$telephoneEventPayloadType"
         val existing = activeRtpSession
         if (existing != null && activeRtpEndpointKey == endpointKey) {
             Log.i(TAG, "Reusing prewarmed RTP session for $remoteAddr:$remotePort")
             if (captureAfterElapsed != null && captureAfterElapsed > 0L) {
-                if (!existing.awaitMediaReady(captureAfterElapsed, MEDIA_READY_TIMEOUT_MS)) {
+                if (!existing.awaitGsmToSipReady(captureAfterElapsed, MEDIA_READY_TIMEOUT_MS)) {
                     existing.stop()
                     if (activeRtpSession === existing) {
                         activeRtpSession = null
@@ -620,7 +645,12 @@ class CallOrchestrator(
         activeRtpEndpointKey = null
         val propagationDelay = prepareRecordAudioForRtp()
         val session = RtpSession(
-            context, localPort, remoteAddr, remotePort, payloadType,
+            context,
+            localPort,
+            remoteAddr,
+            remotePort,
+            payloadType,
+            telephoneEventPayloadType,
             appOpsPropagationDelayMs = propagationDelay
         )
         session.listener = object : RtpSession.Listener {
@@ -660,7 +690,7 @@ class CallOrchestrator(
             return false
         }
         if (captureAfterElapsed != null && captureAfterElapsed > 0L) {
-            if (!session.awaitMediaReady(captureAfterElapsed, MEDIA_READY_TIMEOUT_MS)) {
+            if (!session.awaitGsmToSipReady(captureAfterElapsed, MEDIA_READY_TIMEOUT_MS)) {
                 session.stop()
                 if (activeRtpSession === session) {
                     activeRtpSession = null
@@ -714,6 +744,7 @@ class CallOrchestrator(
             pendingRtpAddr = null
             pendingRtpPort = 0
             pendingPayloadType = 0
+            pendingTelephoneEventPayloadType = null
             pendingLocalRtpPort = 0
             pendingOutboundLocalRtpPort = 0
             outboundRtpPreparationStarted = false

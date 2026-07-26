@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.telecom.Call
 import android.telecom.CallAudioState
@@ -45,6 +47,9 @@ object GsmCallManager {
 
     private val audioPreparationLock = Any()
     @Volatile private var audioPreparationCall: Call? = null
+    private val dtmfHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var dtmfCall: Call? = null
+    private var dtmfStopRunnable: Runnable? = null
 
     /** Optional callback for routing important audio diagnostics to the
      *  app log viewer (Settings tab).  Set by GatewayService. */
@@ -108,6 +113,7 @@ object GsmCallManager {
 
     fun onCallRemoved(call: Call) {
         Log.i(TAG, "GSM call removed")
+        stopDtmfTone(call)
         if (activeCall == call) {
             activeCall = null
             activeCallState = Call.STATE_DISCONNECTED
@@ -145,6 +151,7 @@ object GsmCallManager {
             }
             Call.STATE_DISCONNECTED -> {
                 Log.i(TAG, "GSM call disconnected")
+                stopDtmfTone(call)
                 listener?.onGsmCallEnded(call)
                 if (activeCall == call) {
                     activeCall = null
@@ -177,6 +184,60 @@ object GsmCallManager {
         call?.let {
             Log.i(TAG, "Hanging up GSM call")
             it.disconnect()
+        }
+    }
+
+    /** Send an RFC2833 digit to the active cellular call through Telecom. */
+    fun playDtmfTone(digit: Char): Boolean {
+        if (digit !in "0123456789*#") {
+            Log.w(TAG, "Ignoring unsupported DTMF digit: $digit")
+            return false
+        }
+        val call = activeCall
+        if (call == null || activeCallState != Call.STATE_ACTIVE) {
+            appLog("DTMF $digit ignored: no active GSM call")
+            return false
+        }
+
+        dtmfHandler.post {
+            if (activeCall !== call || activeCallState != Call.STATE_ACTIVE) return@post
+            dtmfStopRunnable?.let { dtmfHandler.removeCallbacks(it) }
+            try {
+                dtmfCall?.stopDtmfTone()
+                call.playDtmfTone(digit)
+                dtmfCall = call
+                appLog("GSM DTMF sent: $digit")
+                Runnable {
+                    if (dtmfCall === call) {
+                        try {
+                            call.stopDtmfTone()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to stop DTMF tone: ${e.message}")
+                        }
+                        dtmfCall = null
+                    }
+                }.also { stop ->
+                    dtmfStopRunnable = stop
+                    dtmfHandler.postDelayed(stop, DTMF_TONE_DURATION_MS)
+                }
+            } catch (e: Exception) {
+                appLog("GSM DTMF $digit failed: ${e.message}")
+            }
+        }
+        return true
+    }
+
+    private fun stopDtmfTone(call: Call) {
+        dtmfHandler.post {
+            if (dtmfCall !== call) return@post
+            dtmfStopRunnable?.let { dtmfHandler.removeCallbacks(it) }
+            dtmfStopRunnable = null
+            try {
+                call.stopDtmfTone()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to stop DTMF on call end: ${e.message}")
+            }
+            dtmfCall = null
         }
     }
 
@@ -508,4 +569,6 @@ object GsmCallManager {
     /** Get current call number */
     val currentNumber: String?
         get() = activeCall?.details?.handle?.schemeSpecificPart
+
+    private const val DTMF_TONE_DURATION_MS = 160L
 }

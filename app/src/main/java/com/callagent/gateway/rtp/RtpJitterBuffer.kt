@@ -2,11 +2,13 @@ package com.callagent.gateway.rtp
 
 import java.util.TreeMap
 import kotlin.math.abs
+import kotlin.math.ceil
 
 /** Ordered, bounded playout buffer for 20 ms PCMA RTP frames. */
 class RtpJitterBuffer(
     private val initialPrefillFrames: Int = 3,
-    private val maximumFrames: Int = 5,
+    private val maximumFrames: Int = 12,
+    private val maximumTargetFrames: Int = 6,
     private val rebufferAfterMissingFrames: Int = 3,
     private val maximumConcealedGapFrames: Int = 5,
 ) {
@@ -18,6 +20,8 @@ class RtpJitterBuffer(
 
     data class Stats(
         val buffered: Int,
+        val targetFrames: Int,
+        val capacityFrames: Int,
         val accepted: Long,
         val played: Long,
         val concealed: Long,
@@ -43,6 +47,10 @@ class RtpJitterBuffer(
     private var consecutiveMisses = 0
     private var previousTransit: Double? = null
     private var jitter = 0.0
+    private var jitterSampleCount = 0
+    private var targetFrames = initialPrefillFrames
+    private var lastImpairmentNanos = 0L
+    private var lastTargetChangeNanos = 0L
 
     private var acceptedCount = 0L
     private var playedCount = 0L
@@ -77,6 +85,7 @@ class RtpJitterBuffer(
         }
         if (expectedSequence?.let { extendedSequence < it } == true) {
             lateCount++
+            increaseTarget(arrivalNanos)
             return false
         }
         if (highestExtendedSequence?.let { extendedSequence < it } == true) {
@@ -85,13 +94,22 @@ class RtpJitterBuffer(
         highestExtendedSequence = maxOf(highestExtendedSequence ?: extendedSequence, extendedSequence)
         frames[extendedSequence] = packet
         acceptedCount++
+        adaptTarget(arrivalNanos)
 
-        while (frames.size > maximumFrames) {
-            val removed = frames.pollFirstEntry() ?: break
-            overflowCount++
-            if (expectedSequence == null || expectedSequence == removed.key) {
-                expectedSequence = removed.key + 1
+        if (frames.size > maximumFrames) {
+            // A stalled consumer can create a burst larger than capacity. Do
+            // one explicit timeline resync instead of repeatedly advancing
+            // the expected sequence and manufacturing conceal/late cascades.
+            increaseTarget(arrivalNanos)
+            val keep = targetFrames.coerceAtMost(maximumFrames)
+            while (frames.size > keep) {
+                frames.pollFirstEntry() ?: break
+                overflowCount++
             }
+            expectedSequence = frames.firstKey()
+            playoutStarted = false
+            consecutiveMisses = 0
+            resyncCount++
         }
         return true
     }
@@ -99,7 +117,7 @@ class RtpJitterBuffer(
     @Synchronized
     fun poll(): Playout {
         if (!playoutStarted) {
-            if (frames.size < initialPrefillFrames) return Playout.Buffering
+            if (frames.size < targetFrames) return Playout.Buffering
             expectedSequence = frames.firstKey()
             playoutStarted = true
             consecutiveMisses = 0
@@ -117,6 +135,7 @@ class RtpJitterBuffer(
         val next = frames.firstEntry()?.key
         if (next != null && next > expected) {
             if (next - expected > maximumConcealedGapFrames) {
+                increaseTarget(System.nanoTime())
                 expectedSequence = next
                 resyncCount++
                 return Playout.Buffering
@@ -124,11 +143,13 @@ class RtpJitterBuffer(
             expectedSequence = expected + 1
             consecutiveMisses++
             concealedCount++
+            increaseTarget(System.nanoTime())
             return Playout.Missing
         }
 
         underrunCount++
         consecutiveMisses++
+        increaseTarget(System.nanoTime())
         if (consecutiveMisses >= rebufferAfterMissingFrames) {
             playoutStarted = false
             expectedSequence = expected + 1
@@ -154,11 +175,17 @@ class RtpJitterBuffer(
         invalidCount = 0
         resyncCount = 0
         ssrcChangeCount = 0
+        targetFrames = initialPrefillFrames
+        lastImpairmentNanos = 0L
+        lastTargetChangeNanos = 0L
+        jitterSampleCount = 0
     }
 
     @Synchronized
     fun stats(): Stats = Stats(
         buffered = frames.size,
+        targetFrames = targetFrames,
+        capacityFrames = maximumFrames,
         accepted = acceptedCount,
         played = playedCount,
         concealed = concealedCount,
@@ -198,8 +225,39 @@ class RtpJitterBuffer(
         previousTransit?.let { previous ->
             val delta = abs(transit - previous)
             jitter += (delta - jitter) / 16.0
+            jitterSampleCount++
         }
         previousTransit = transit
+    }
+
+    private fun adaptTarget(nowNanos: Long) {
+        val effectiveMaximumTarget = minOf(maximumTargetFrames, maximumFrames)
+        val jitterFrames = if (jitterSampleCount >= JITTER_ADAPTATION_MIN_SAMPLES) {
+            ceil(jitter / SAMPLES_PER_FRAME).toInt()
+        } else {
+            0
+        }
+        val networkTarget = (initialPrefillFrames + jitterFrames)
+            .coerceIn(initialPrefillFrames, effectiveMaximumTarget)
+        if (networkTarget > targetFrames) {
+            targetFrames = networkTarget
+            lastTargetChangeNanos = nowNanos
+            return
+        }
+        if (targetFrames > networkTarget &&
+            nowNanos - lastImpairmentNanos >= TARGET_DECREASE_STABLE_NANOS &&
+            nowNanos - lastTargetChangeNanos >= TARGET_DECREASE_STABLE_NANOS) {
+            targetFrames--
+            lastTargetChangeNanos = nowNanos
+        }
+    }
+
+    private fun increaseTarget(nowNanos: Long) {
+        lastImpairmentNanos = nowNanos
+        if (targetFrames < minOf(maximumTargetFrames, maximumFrames)) {
+            targetFrames++
+            lastTargetChangeNanos = nowNanos
+        }
     }
 
     private fun rememberPlayed(sequence: Long) {
@@ -222,11 +280,14 @@ class RtpJitterBuffer(
         consecutiveMisses = 0
         previousTransit = null
         jitter = 0.0
+        jitterSampleCount = 0
     }
 
     companion object {
         private const val SAMPLES_PER_FRAME = 160
         private const val RTP_CLOCK_RATE = 8_000.0
         private const val RECENT_SEQUENCE_LIMIT = 64
+        private const val TARGET_DECREASE_STABLE_NANOS = 10_000_000_000L
+        private const val JITTER_ADAPTATION_MIN_SAMPLES = 10
     }
 }

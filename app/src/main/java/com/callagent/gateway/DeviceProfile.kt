@@ -97,6 +97,9 @@ data class DeviceProfile(
 
     /** Delay (ms) for appops propagation on cold boot. */
     val appopsPropagationMs: Long,
+
+    /** Optional readback performed after SIP answer, never on the media gate. */
+    val mixerIncallMusicVerifyCmd: String = "",
 ) {
     companion object {
         private const val TAG = "DeviceProfile"
@@ -489,11 +492,12 @@ data class DeviceProfile(
             //   SIFS0 has only playback mixer (AudioTrack), NOT modem downlink
             //   (which goes through SIFS1→UAIF1→speaker amp).
             mixerIncallMusicCmd = buildString {
-                // Reroute NSRC0+NSRC1 → SIFS0 (playback mixer → modem TX bridge)
-                append("tinymix 'ABOX NSRC0' 'SIFS0' 2>/dev/null; ")
-                append("tinymix 'ABOX NSRC1' 'SIFS0' 2>/dev/null; ")
-                append("sleep 0.1; ")
-                // Verify readback
+                // Keep GSM ACTIVE's critical path to the two required writes.
+                append("tinymix 'ABOX NSRC0' 'SIFS0' 2>/dev/null && ")
+                append("tinymix 'ABOX NSRC1' 'SIFS0' 2>/dev/null && ")
+                append("echo ABOX_NSRC_READY")
+            },
+            mixerIncallMusicVerifyCmd = buildString {
                 append("echo 'NSRC_REROUTE:'; ")
                 append("echo -n 'NSRC0='; tinymix 'ABOX NSRC0' 2>/dev/null; ")
                 append("echo -n 'NSRC1='; tinymix 'ABOX NSRC1' 2>/dev/null; ")

@@ -35,6 +35,16 @@ object RootShell {
     @Volatile private var workerThread: Thread? = null
     @Volatile private var alive = false
 
+    data class Result(
+        val exitCode: Int,
+        val output: String,
+        val durationMs: Long,
+        val timedOut: Boolean,
+    ) {
+        val succeeded: Boolean
+            get() = !timedOut && exitCode == 0 && output.isNotBlank()
+    }
+
     /** Ensure the persistent shell is running. Safe to call multiple times. */
     @Synchronized
     fun init() {
@@ -95,6 +105,46 @@ object RootShell {
             return ""
         }
         return command.output
+    }
+
+    /**
+     * Run a short media-critical command outside the diagnostic FIFO. This
+     * prevents a full mixer dump from delaying the two ABOX routing writes at
+     * GSM ACTIVE. Critical commands must print an explicit success marker;
+     * an empty result is deliberately not considered successful.
+     */
+    fun execCritical(cmd: String, timeoutMs: Long = 1500): Result {
+        val started = android.os.SystemClock.elapsedRealtime()
+        return try {
+            val proc = ProcessBuilder("su", "-c", cmd)
+                .redirectErrorStream(true)
+                .start()
+            val completed = proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!completed) {
+                proc.destroy()
+                if (proc.isAlive) proc.destroyForcibly()
+                Result(
+                    exitCode = -1,
+                    output = "",
+                    durationMs = android.os.SystemClock.elapsedRealtime() - started,
+                    timedOut = true,
+                )
+            } else {
+                Result(
+                    exitCode = proc.exitValue(),
+                    output = proc.inputStream.bufferedReader().readText().trim(),
+                    durationMs = android.os.SystemClock.elapsedRealtime() - started,
+                    timedOut = false,
+                )
+            }
+        } catch (e: Exception) {
+            Result(
+                exitCode = -1,
+                output = e.message.orEmpty(),
+                durationMs = android.os.SystemClock.elapsedRealtime() - started,
+                timedOut = false,
+            )
+        }
     }
 
     private fun executeInternal(command: Command) {

@@ -87,6 +87,41 @@ class RtpJitterBufferTest {
         assertEquals(1, buffer.stats().late)
         assertEquals(2, buffer.stats().concealed)
         assertEquals(3, buffer.stats().underruns)
+        assertTrue(buffer.stats().targetFrames > 3)
+    }
+
+    @Test
+    fun raisesTargetForArrivalJitterAndLowersAfterStableWindow() {
+        val buffer = RtpJitterBuffer(maximumFrames = 1_000)
+        var arrival = 1_000_000_000L
+        buffer.offer(packet(1), arrival)
+        arrival += 80_000_000L
+        buffer.offer(packet(2), arrival)
+        arrival += 20_000_000L
+        buffer.offer(packet(3), arrival)
+        for (sequence in 4..12) {
+            arrival += if (sequence % 2 == 0) 80_000_000L else 20_000_000L
+            buffer.offer(packet(sequence), arrival)
+        }
+        assertTrue(buffer.stats().targetFrames > 3)
+
+        val raised = buffer.stats().targetFrames
+        for (sequence in 13..613) {
+            arrival += 20_000_000L
+            buffer.offer(packet(sequence), arrival)
+        }
+        assertTrue(buffer.stats().targetFrames <= raised)
+        assertTrue(buffer.stats().targetFrames >= 3)
+    }
+
+    @Test
+    fun overflowPerformsSingleControlledResync() {
+        val buffer = RtpJitterBuffer(initialPrefillFrames = 3, maximumFrames = 6)
+        for (sequence in 1..7) buffer.offer(packet(sequence))
+
+        assertEquals(1, buffer.stats().resync)
+        assertTrue(buffer.stats().buffered <= buffer.stats().targetFrames)
+        assertTrue(buffer.stats().overflow > 0)
     }
 
     private fun packet(sequence: Int, ssrc: Long = 7): RtpPacket = RtpPacket(

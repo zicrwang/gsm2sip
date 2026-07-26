@@ -139,6 +139,33 @@ class SipMessage private constructor(
             }
         }
 
+    /** Dynamic payload type negotiated for RFC2833/4733 DTMF events. */
+    val sdpTelephoneEventPayloadType: Int?
+        get() {
+            val lines = body.lineSequence().map { it.trim() }.toList()
+            val audioStart = lines.indexOfFirst { it.startsWith("m=audio") }
+            if (audioStart < 0) return null
+            val mLine = lines[audioStart]
+            val audioPayloadTypes = mLine.split(Regex("\\s+"))
+                .drop(3)
+                .mapNotNull { it.toIntOrNull() }
+                .toSet()
+
+            for (index in audioStart + 1 until lines.size) {
+                val line = lines[index]
+                if (line.startsWith("m=")) break
+                if (!line.startsWith("a=rtpmap:", ignoreCase = true)) continue
+                val mapping = line.substringAfter(':').split(Regex("\\s+"), limit = 2)
+                val payloadType = mapping.getOrNull(0)?.toIntOrNull() ?: continue
+                val encoding = mapping.getOrNull(1) ?: continue
+                if (payloadType in audioPayloadTypes &&
+                    encoding.equals("telephone-event/8000", ignoreCase = true)) {
+                    return payloadType
+                }
+            }
+            return null
+        }
+
     /** Check for custom gateway header: X-GSM-Forward */
     val gsmForwardNumber: String?
         get() = header("x-gsm-forward")?.trim()
@@ -261,11 +288,14 @@ object SipBuilder {
         username: String, localIp: String, localPort: Int,
         localRtpPort: Int? = null,
         toTag: String = tag(),
-        mediaReady: Boolean = false
+        mediaReady: Boolean = false,
+        telephoneEventPayloadType: Int? = DEFAULT_TELEPHONE_EVENT_PAYLOAD_TYPE,
     ): String {
         val to = msg.to ?: ""
         val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
-        val sdp = if (localRtpPort != null) buildSdp(localIp, localRtpPort) else null
+        val sdp = if (localRtpPort != null) {
+            buildSdp(localIp, localRtpPort, telephoneEventPayloadType)
+        } else null
         return buildString {
             append("SIP/2.0 200 OK\r\n")
             append("Via: ${msg.via}\r\n")
@@ -306,6 +336,32 @@ object SipBuilder {
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
             append("Content-Length: 0\r\n\r\n")
+        }
+    }
+
+    fun sessionProgress183(
+        msg: SipMessage,
+        username: String,
+        localIp: String,
+        localPort: Int,
+        localRtpPort: Int,
+        toTag: String = tag(),
+        telephoneEventPayloadType: Int? = DEFAULT_TELEPHONE_EVENT_PAYLOAD_TYPE,
+    ): String {
+        val to = msg.to ?: ""
+        val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
+        val sdp = buildSdp(localIp, localRtpPort, telephoneEventPayloadType)
+        return buildString {
+            append("SIP/2.0 183 Session Progress\r\n")
+            append("Via: ${msg.via}\r\n")
+            append("To: $toWithTag\r\n")
+            append("From: ${msg.from}\r\n")
+            append("Call-ID: ${msg.callId}\r\n")
+            append("CSeq: ${msg.cseq}\r\n")
+            append("Contact: <sip:$username@$localIp:$localPort>\r\n")
+            append("Content-Type: application/sdp\r\n")
+            append("Content-Length: ${sdp.length}\r\n\r\n")
+            append(sdp)
         }
     }
 
@@ -372,7 +428,11 @@ object SipBuilder {
             append("Content-Length: 0\r\n\r\n")
         }
 
-    private fun buildSdp(localIp: String, rtpPort: Int): String = buildString {
+    private fun buildSdp(
+        localIp: String,
+        rtpPort: Int,
+        telephoneEventPayloadType: Int? = DEFAULT_TELEPHONE_EVENT_PAYLOAD_TYPE,
+    ): String = buildString {
         // The gateway deliberately offers PCMA only.  Keeping G.722 in the
         // offer lets Asterisk select a codec that the Android HAL cannot
         // actually capture or play, resulting in an immediate BYE/silence.
@@ -381,11 +441,17 @@ object SipBuilder {
         append("s=SIP Call\r\n")
         append("c=IN IP4 $localIp\r\n")
         append("t=0 0\r\n")
-        append("m=audio $rtpPort RTP/AVP 8 101\r\n")
+        append("m=audio $rtpPort RTP/AVP 8")
+        telephoneEventPayloadType?.let { append(" $it") }
+        append("\r\n")
         append("a=rtpmap:8 PCMA/8000\r\n")
-        append("a=rtpmap:101 telephone-event/8000\r\n")
-        append("a=fmtp:101 0-16\r\n")
+        telephoneEventPayloadType?.let {
+            append("a=rtpmap:$it telephone-event/8000\r\n")
+            append("a=fmtp:$it 0-16\r\n")
+        }
         append("a=ptime:20\r\n")
         append("a=sendrecv\r\n")
     }
+
+    private const val DEFAULT_TELEPHONE_EVENT_PAYLOAD_TYPE = 101
 }

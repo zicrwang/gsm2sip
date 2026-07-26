@@ -10,6 +10,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.SystemClock
+import android.os.Process
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
@@ -48,6 +49,7 @@ class RtpSession(
     private val remoteAddr: String,
     private val remotePort: Int,
     private val payloadType: Int = RtpPacket.PT_PCMA,
+    telephoneEventPayloadType: Int? = null,
     private val appOpsPropagationDelayMs: Long? = null,
 ) {
     private val running = AtomicBoolean(false)
@@ -63,6 +65,14 @@ class RtpSession(
     private var txSequence = 0
     private var txTimestamp = 0L
     private val txSsrc = (Math.random() * 0xFFFFFFFFL).toLong()
+    @Volatile private var dtmfEventCount = 0L
+    private val telephoneEventReceiver = telephoneEventPayloadType?.let { eventPayloadType ->
+        TelephoneEventReceiver(eventPayloadType) { digit ->
+            dtmfEventCount++
+            Log.i(TAG, "RFC2833 DTMF end: digit=$digit pt=$eventPayloadType")
+            GsmCallManager.playDtmfTone(digit)
+        }
+    }
 
     // Symmetric RTP: latch onto the actual source address of received packets
     @Volatile private var latchedAddr: InetAddress? = null
@@ -72,7 +82,8 @@ class RtpSession(
     // another deep queue on top of AudioTrack and the GSM modem path.
     private val jitterBuffer = RtpJitterBuffer(
         initialPrefillFrames = 3,
-        maximumFrames = 5,
+        maximumFrames = 12,
+        maximumTargetFrames = 6,
     )
 
     // RTP inactivity tracking
@@ -94,6 +105,9 @@ class RtpSession(
     @Volatile private var signalingConnected = false
     @Volatile private var postConnectDiagnosticsEnabled = false
     private val captureDiagnosticsStarted = AtomicBoolean(false)
+    private val injectionPreparationStarted = AtomicBoolean(false)
+    @Volatile private var sipToGsmReady = false
+    @Volatile private var sipToGsmError: String? = null
     private val captureFrameLock = Object()
     private val playbackReady = CountDownLatch(1)
     private val captureStart = CountDownLatch(1)
@@ -189,19 +203,16 @@ class RtpSession(
         return true
     }
 
-    /** Wait for the injection path and for a capture frame produced after GSM ACTIVE. */
-    fun awaitMediaReady(captureAfterElapsed: Long, timeoutMs: Long): Boolean {
+    /**
+     * Gate SIP answer only on the GSM-to-SIP direction. SIP-to-GSM routing is
+     * prepared concurrently and remains digitally muted until it succeeds.
+     */
+    fun awaitGsmToSipReady(captureAfterElapsed: Long, timeoutMs: Long): Boolean {
         val startedAt = SystemClock.elapsedRealtime()
+        startSipToGsmPreparation()
         captureStart.countDown()
         if (!playbackReady.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-            Log.e(TAG, "Media ready timeout: playback did not start in ${timeoutMs}ms")
-            return false
-        }
-        // Telecom may reset call-path mixer controls at the DIALING→ACTIVE
-        // transition. Re-assert them synchronously before signaling answer.
-        enableIncallMusic()
-        if (!applyIncallMusicMixer()) {
-            Log.e(TAG, "Media ready gate: playback injection mixer is not ready")
+            Log.e(TAG, "GSM-to-SIP ready timeout: playback thread did not start in ${timeoutMs}ms")
             return false
         }
 
@@ -216,10 +227,28 @@ class RtpSession(
         val elapsed = SystemClock.elapsedRealtime() - startedAt
         Log.i(
             TAG,
-            "Media ready gate: ready=$ready wait=${elapsed}ms " +
-                "captureAfter=$captureAfterElapsed lastCapture=$lastCaptureFrameElapsed"
+            "GSM-to-SIP ready gate: ready=$ready wait=${elapsed}ms " +
+                "captureAfter=$captureAfterElapsed lastCapture=$lastCaptureFrameElapsed " +
+                "sipToGsmReady=$sipToGsmReady"
         )
         return ready
+    }
+
+    private fun startSipToGsmPreparation() {
+        if (!injectionPreparationStarted.compareAndSet(false, true)) return
+        Thread({
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            val halReady = enableIncallMusic()
+            val mixerReady = applyIncallMusicMixer()
+            val ready = halReady && mixerReady
+            sipToGsmReady = ready
+            if (!ready) {
+                sipToGsmError = "critical mixer routing failed"
+                Log.e(TAG, "SIP-to-GSM injection unavailable; keeping digital silence")
+            } else {
+                Log.i(TAG, "SIP-to-GSM injection ready")
+            }
+        }, "RTP-Injection-$localPort").start()
     }
 
     fun markSignalingConnected() {
@@ -231,6 +260,7 @@ class RtpSession(
     fun startPostConnectDiagnostics() {
         postConnectDiagnosticsEnabled = true
         maybeStartCaptureDiagnostics()
+        verifyIncallMusicMixerAsync()
     }
 
     /**
@@ -393,6 +423,7 @@ class RtpSession(
      * direction (GSM→SIP) takes longer to come up.
      */
     private fun captureInitAndLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         try {
             captureStart.await()
         } catch (_: InterruptedException) {
@@ -826,6 +857,7 @@ class RtpSession(
     // ── Receive: RTP recv → jitter buffer ───────────────
 
     private fun receiveLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val buf = ByteArray(4096)
         while (running.get()) {
             try {
@@ -848,6 +880,7 @@ class RtpSession(
                     firstRxInfo = "pt=${rtp.payloadType} len=${rtp.payload.size} hex=$hexHead"
                     Log.i(TAG, "First RX: $firstRxInfo")
                 }
+                if (telephoneEventReceiver?.offer(rtp) == true) continue
                 // The SIP offer/answer is PCMA-only. The jitter buffer keeps
                 // sequence, timestamp and SSRC so burst and reorder handling
                 // does not depend on UDP arrival order.
@@ -905,12 +938,14 @@ class RtpSession(
                 val jitterStats = jitterBuffer.stats()
                 val stats = "tx=$txPacketCount rx=$rxPacketCount writes=$playbackFrames " +
                         "capRMS=$captureRms rawCapRMS=$rawCaptureRms playRMS=$playbackRms src=$audioSourceName " +
-                        "rate=${captureRate}/${playbackRate} jbuf=${jitterStats.buffered} jitterMs=${jitterStats.jitterMs} " +
+                        "rate=${captureRate}/${playbackRate} jbuf=${jitterStats.buffered}/${jitterStats.targetFrames}/${jitterStats.capacityFrames} jitterMs=${jitterStats.jitterMs} " +
                         "rtp:accepted=${jitterStats.accepted} played=${jitterStats.played} " +
                         "concealed=${jitterStats.concealed} underrun=${jitterStats.underruns} " +
                         "duplicate=${jitterStats.duplicate} reordered=${jitterStats.reordered} " +
                         "late=${jitterStats.late} overflow=${jitterStats.overflow} " +
                         "invalid=${jitterStats.invalid} resync=${jitterStats.resync} ssrc=${jitterStats.ssrcChanges} " +
+                        "dtmf=$dtmfEventCount " +
+                        "media:gsmToSip=${lastCaptureFrameElapsed > 0} sipToGsm=$sipToGsmReady sipToGsmError=${sipToGsmError ?: "none"} " +
                         "gates:echo=$echoGatedFrames noise=$noiseGatedFrames fwd=$forwardedFrames dt=$doubleTalkFrames echoG=${"%.2f".format(echoGainRatio)}" +
                         "$cpuInfo$volInfo" + extraInfo
                 Log.i(TAG, "RTP: $stats")
@@ -931,6 +966,7 @@ class RtpSession(
     // ── Playback: jitter buffer → decode → speaker → mic → GSM uplink ──
 
     private fun playbackLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val track = audioTrack ?: return
 
         track.play()
@@ -994,9 +1030,13 @@ class RtpSession(
                 // threshold was calibrated to raw codec output levels.  If
                 // playbackGain > 1, measuring after gain would lower the
                 // effective threshold, over-suppressing caller speech.
-                val rawRms = pcmRms(rawPcm)
+                // Never fall back to the physical microphone while the
+                // digital modem-TX route is unresolved. Keep AudioTrack alive
+                // with digital silence and open the gate atomically on success.
+                val gatedRawPcm = if (sipToGsmReady) rawPcm else silenceFrame
+                val rawRms = pcmRms(gatedRawPcm)
                 currentPlaybackActive = rawRms > echoGateThreshold
-                val pcm = if (playbackGain > 1) rawPcm.copyOf() else rawPcm
+                val pcm = if (playbackGain > 1) gatedRawPcm.copyOf() else gatedRawPcm
 
                 // Software gain: boost PCM before writing to AudioTrack.
                 // This increases the digital level injected via incall_music
@@ -1125,10 +1165,11 @@ class RtpSession(
      * We also try Samsung-specific parameter names as fallbacks in case
      * the standard parameter is not implemented in this LineageOS build.
      */
-    private fun enableIncallMusic() {
+    private fun enableIncallMusic(): Boolean {
         try {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            am?.let {
+            if (am == null) return false
+            am.let {
                 // Force a false→true transition to start the incall-music
                 // usecase in the HAL.  configureAudioBridge() no longer
                 // primes true (it caused problems: the earpiece→speaker
@@ -1169,13 +1210,15 @@ class RtpSession(
                 Log.i(TAG, msg)
                 listener?.onRtpStats(msg)
             }
+            return true
         } catch (e: Exception) {
             Log.w(TAG, "Failed to set incall_music_enabled: ${e.message}")
             listener?.onRtpStats("incall_music FAILED: ${e.message}")
+            return false
         }
     }
 
-    /** Apply the profile's essential injection controls synchronously. */
+    /** Apply only the essential injection writes on an independent root channel. */
     private fun applyIncallMusicMixer(): Boolean {
         val mixerCmd = profile.mixerIncallMusicCmd
         if (mixerCmd.isEmpty()) {
@@ -1189,20 +1232,35 @@ class RtpSession(
             listener?.onRtpStats(msg)
             return false
         }
-        return try {
-            // Keep the SIP-answer critical path limited to exact profile
-            // controls. Full tinymix diagnostics run independently from
-            // logCaptureDiagnostics() and must not block the 200 response.
-            val output = RootShell.execForOutput(resolvedMixerCmd, timeoutMs = 2000)
-            val msg = "Mixer incall_music: $output"
+        val result = RootShell.execCritical(
+            "($resolvedMixerCmd) && echo INCALL_MIXER_READY",
+            timeoutMs = 1500,
+        )
+        val msg = "Mixer critical: exit=${result.exitCode} timeout=${result.timedOut} " +
+            "duration=${result.durationMs}ms output=${result.output.take(160)}"
+        if (result.succeeded && result.output.contains("INCALL_MIXER_READY")) {
             Log.i(TAG, msg)
             listener?.onRtpStats(msg)
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "Mixer fallback failed: ${e.message}")
-            listener?.onRtpStats("Mixer incall_music FAILED: ${e.message}")
-            false
+            return true
         }
+        Log.e(TAG, msg)
+        listener?.onRtpStats("Mixer incall_music FAILED: $msg")
+        return false
+    }
+
+    private fun verifyIncallMusicMixerAsync() {
+        val command = profile.mixerIncallMusicVerifyCmd
+        if (command.isEmpty()) return
+        Thread({
+            val resolved = DeviceProfile.resolveCmd(command)
+            if (resolved.isEmpty()) return@Thread
+            val started = SystemClock.elapsedRealtime()
+            val output = RootShell.execForOutput(resolved, timeoutMs = 3000)
+            val elapsed = SystemClock.elapsedRealtime() - started
+            val msg = "Mixer post-connect verify: duration=${elapsed}ms output=${output.take(500)}"
+            if (output.isBlank()) Log.w(TAG, msg) else Log.i(TAG, msg)
+            listener?.onRtpStats(msg)
+        }, "RTP-Mixer-Verify-$localPort").start()
     }
 
     /**

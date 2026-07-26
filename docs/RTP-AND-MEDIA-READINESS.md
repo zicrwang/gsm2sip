@@ -1,6 +1,6 @@
 # RTP 与媒体就绪
 
-本文描述 gsm2sip `2.8.69` 的 RTP 接收时间线，以及 SIP 接通前的媒体就绪边界。
+本文描述 gsm2sip `2.8.70` 的 RTP 接收时间线，以及 SIP 接通前的媒体就绪边界。
 
 ## 固定媒体格式
 
@@ -12,11 +12,22 @@
 RTP 解析会处理 CSRC、扩展头和 padding。payload type 或净负载长度不匹配的包
 计入 `invalid`，不会送入 Android 音频输出。
 
+## RFC2833 DTMF
+
+SDP 会从首个 `m=audio` 媒体段解析协商的 `telephone-event/8000` 动态 payload
+type。RTP 接收循环在音频抖动缓冲前分流这些事件包，并只在结束位出现时触发
+按键。RFC2833 通常重复发送结束包，网关按 SSRC、RTP timestamp 和 event 编号
+去重。
+
+事件 `0..9`、`10`、`11` 分别映射到 `0..9`、`*`、`#`，再通过活动 Android
+Telecom `Call` 播放 160 ms DTMF。未协商 telephone-event、GSM 尚未 ACTIVE、
+负载不足 4 字节或 A-D 事件均不会触发蜂窝按键。
+
 ## 接收时间线
 
 `RtpJitterBuffer` 按 SSRC 和扩展序列号排序：
 
-- 3 帧预缓冲，最大 5 帧；
+- 初始目标 3 帧，按 RFC 3550 jitter、迟到和欠载在 3 至 6 帧自适应，容量 12 帧；
 - 支持 16 位序列号回绕；
 - 重复包和播放截止后的迟到包不进入输出；
 - 短缺包用上一帧 PCM 乘以 `0.72` 衰减补偿；
@@ -60,9 +71,60 @@ Asterisk dialplan 不保证跨两条呼叫腿复制任意自定义响应头，�
 - `concealed` / `underrun`：丢包补偿和无后续包欠载；
 - `resync` / `ssrcChanges`：序列大跳变和 SSRC 切换；
 - `jitterMs`：RFC 3550 风格的到达抖动估算。
+- `dtmf`：已去重并转发到 GSM 通话的 RFC2833 按键数。
 
 干净局域网的目标是 `overflow=0`，`concealed` 与 `underrun` 接近 0，收发速率约
 为每秒 50 包。
+
+## 已实施：音频启动与抖动缓冲优化
+
+### 真机基线
+
+2026-07-27 使用 MI8、WPhone、Asterisk 和 `10086` 完整链路验证：
+
+- WPhone 冷启动音频图在一次恢复后于 320 ms 就绪，随后成功发送 INVITE；
+- WPhone 热启动预热耗时为 0 ms；
+- MI8 从 GSM `ACTIVE` 到发送 SIP 200 OK 为 1293 ms；
+- 其中 `Media ready gate` 为 1276 ms，ACTIVE 后约 12 ms 已取得首个捕获帧；
+- root 音频诊断已经在 SIP 接通后启动，不再直接阻塞 SIP 200 OK。
+
+实现已将两个方向拆分：`gsmToSipReady` 只等待 RTP/播放线程和 ACTIVE 后捕获帧，
+`sipToGsmReady` 在独立音频优先级线程完成 HAL 参数及 mixer 写入。后者未成功前
+AudioTrack 只写数字静音，不会回退到物理麦克风。
+
+### 启动优化顺序
+
+1. 媒体门控已拆分为 `gsmToSipReady` 和 `sipToGsmReady`。GSM `ACTIVE` 后，只要
+   RTP socket、播放线程和 ACTIVE 之后的 AudioRecord 捕获帧已就绪，即可发送
+   SIP 200 OK；TX 注入路由同时完成，未就绪期间必须保持数字静音，不能回退到
+   物理麦克风。
+2. SIP 200 OK 前的 root mixer 命令只保留 `ABOX NSRC0 -> SIFS0` 和
+   `ABOX NSRC1 -> SIFS0` 两次写入；100 ms 等待已删除，四项读回移到接通后。
+3. 关键写入使用独立 `su -c` 通道，不与 discovery、完整 `tinymix`、PCM/ALSA
+   诊断共用 FIFO。
+4. root 关键结果包含退出码、输出、耗时和超时标记，并要求显式成功标记；超时、
+   非零退出或空输出均保持 `sipToGsmReady=false` 和数字静音。
+5. 网关在 RTP socket 预热成功后发送带 SDP 的 SIP 183；WPhone 可在最终 200 OK
+   前启动 early media。最终应答仍只由 GSM ACTIVE 后的 `gsmToSipReady` 决定。
+
+### 抖动缓冲方向
+
+- 队列容量为 12 帧，初始目标为 3 帧，根据 RFC 3550 jitter、`late` 和
+  `underrun` 在 3 至 6 帧间调整；异常时快速增加，稳定至少 10 秒后逐帧降低。
+- Android RTP 收包、AudioTrack 播放和 AudioRecord 捕获线程均使用音频优先级。
+- 队列超过容量时执行一次受控时间线重同步，保留当前目标深度，不逐包推进期望
+  序号，避免 `overflow -> concealed -> late` 连锁。
+- 当前上一帧乘以 `0.72` 的补偿只适合短缺包。连续丢包应逐步过渡到语音周期
+  复制、重叠淡化和舒适噪声；若本地实现仍不稳定，再评估成熟的语音抖动缓冲库。
+
+### 阶段验收目标
+
+- `GSM_ACTIVE->SIP_200`：常态小于 300 ms，P95 小于 500 ms；
+- ACTIVE 后首个 GSM 到 SIP RTP 音频帧：小于 100 ms；
+- 干净局域网 10 分钟通话：`overflow=0`，`late`、`concealed` 和 `underrun`
+  各自低于接收包数的 1%；
+- 冷启动、连续快速重拨、锁屏和录音开启场景分别验收，不能只使用热启动结果；
+- 所有优化必须继续保证物理麦克风不会混入蜂窝上行。
 
 ## 构建与验收
 

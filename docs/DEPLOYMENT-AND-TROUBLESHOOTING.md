@@ -164,7 +164,7 @@ gateway-magisk.zip
 6005fefd8161b3ef1e12a4faaa80d3785f6233f2ef32b84314bc13eea1089090
 ```
 
-APK 版本应为 `2.8.69`（versionCode `347`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.70`（versionCode `348`），并通过 APK Signature Scheme
 v2 验证。
 
 v2.8.69 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与

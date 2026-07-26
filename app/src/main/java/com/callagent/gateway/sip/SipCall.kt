@@ -46,6 +46,7 @@ class SipCall(
     var remoteRtpPort: Int = 0
     var remoteRtpAddress: String? = null
     var negotiatedPayloadType: Int = 8 // default PCMA, updated from SDP
+    var negotiatedTelephoneEventPayloadType: Int? = 101
 
     // Caller info (for inbound and outbound caller-ID)
     var callerNumber: String? = null
@@ -59,6 +60,7 @@ class SipCall(
 
     // Original INVITE (for building responses)
     var originalInvite: SipMessage? = null
+    @Volatile private var earlyMediaSent = false
 
     var listener: Listener? = null
 
@@ -83,6 +85,7 @@ class SipCall(
                 msg.sdpRtpPort?.let { remoteRtpPort = it }
                 msg.sdpAddress?.let { remoteRtpAddress = it }
                 negotiatedPayloadType = msg.sdpPreferredPayloadType
+                negotiatedTelephoneEventPayloadType = msg.sdpTelephoneEventPayloadType
                 if (negotiatedPayloadType < 0) {
                     Log.e(TAG, "200 OK has no supported PCMA codec: ${msg.sdpCodecs}")
                     state = State.TERMINATED
@@ -100,7 +103,11 @@ class SipCall(
                     return true
                 }
 
-                Log.i(TAG, "SDP codec: pt=$negotiatedPayloadType codecs=${msg.sdpCodecs}")
+                Log.i(
+                    TAG,
+                    "SDP codec: pt=$negotiatedPayloadType " +
+                        "telephoneEventPt=$negotiatedTelephoneEventPayloadType codecs=${msg.sdpCodecs}"
+                )
                 state = State.ANSWERED
 
                 val addr = remoteRtpAddress ?: remoteContactAddress?.first
@@ -218,7 +225,10 @@ class SipCall(
 
         val ok = SipBuilder.ok200(
             invite, sipClient.username, sipClient.publicIp, sipClient.localPort,
-            localRtpPort = localRtpPort, toTag = toTag, mediaReady = mediaReady
+            localRtpPort = localRtpPort,
+            toTag = toTag,
+            mediaReady = mediaReady,
+            telephoneEventPayloadType = negotiatedTelephoneEventPayloadType,
         )
 
         val address = invite.contactAddress ?: sipClient.serverAddress
@@ -230,6 +240,27 @@ class SipCall(
             "Sent 200 OK for inbound call $callId " +
                 "(RTP port: $localRtpPort, mediaReady=$mediaReady)"
         )
+    }
+
+    /** Advertise the already-bound RTP socket while the GSM leg is ringing. */
+    @Synchronized
+    fun sendEarlyMedia(localRtpPort: Int) {
+        if (earlyMediaSent || state == State.ANSWERED || state == State.TERMINATED) return
+        val invite = originalInvite ?: return
+        this.localRtpPort = localRtpPort
+        val progress = SipBuilder.sessionProgress183(
+            invite,
+            sipClient.username,
+            sipClient.publicIp,
+            sipClient.localPort,
+            localRtpPort,
+            localTag,
+            negotiatedTelephoneEventPayloadType,
+        )
+        sipClient.sendResponse(progress, invite.contactAddress ?: sipClient.serverAddress)
+        earlyMediaSent = true
+        state = State.RINGING
+        Log.i(TAG, "Sent 183 Session Progress for $callId (RTP port: $localRtpPort)")
     }
 
     /** Send ACK for a received 200 OK */

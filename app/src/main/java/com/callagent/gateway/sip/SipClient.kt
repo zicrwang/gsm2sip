@@ -343,9 +343,11 @@ class SipClient(
         msg.sdpRtpPort?.let { call.remoteRtpPort = it }
         msg.sdpAddress?.let { call.remoteRtpAddress = it }
         call.negotiatedPayloadType = msg.sdpPreferredPayloadType
+        call.negotiatedTelephoneEventPayloadType = msg.sdpTelephoneEventPayloadType
         Log.i(
             TAG,
             "Incoming INVITE codec: pt=${call.negotiatedPayloadType} " +
+                "telephoneEventPt=${call.negotiatedTelephoneEventPayloadType} " +
                 "codecs=${msg.sdpCodecs} wphoneMediaReady=${msg.wphoneMediaReady}"
         )
 
