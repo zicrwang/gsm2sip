@@ -936,11 +936,9 @@ class RtpSession(
         // the HAL routes through deep-buffer-playback instead of incall-music,
         // and the audio never reaches the voice TX (uplink).
         enableIncallMusic()
-        // Set mixer controls via root — also handles Voice Tx Mute=0.
-        // No separate ensureVoiceTxOpen() call here: the mixer thread below
-        // already issues that command, and waiting for su -c was blocking
-        // the playback thread for ~100ms.
-        enableIncallMusicViaMixer()
+        // The mixer is re-asserted once, synchronously, by awaitMediaReady()
+        // after GSM reaches ACTIVE. Starting another root job here races that
+        // gate and can delay SIP answer behind duplicate work.
         playbackReady.countDown()
 
         // Silence frame for when jitter buffer is empty — prevents underruns
@@ -1171,18 +1169,7 @@ class RtpSession(
         }
     }
 
-    /**
-     * Fallback: use root (Magisk) to set incall_music mixer controls
-     * directly via tinymix.  Device-specific commands from the profile.
-     *
-     * The bare 'tinymix' in profile commands is resolved to the
-     * discovered full path via [DeviceProfile.resolveCmd].
-     */
-    private fun enableIncallMusicViaMixer() {
-        Thread({ applyIncallMusicMixer() }, "RTP-Mixer").start()
-    }
-
-    /** Apply and verify the profile's injection mixer controls synchronously. */
+    /** Apply the profile's essential injection controls synchronously. */
     private fun applyIncallMusicMixer(): Boolean {
         val mixerCmd = profile.mixerIncallMusicCmd
         if (mixerCmd.isEmpty()) {
@@ -1197,11 +1184,10 @@ class RtpSession(
             return false
         }
         return try {
-            // Run device-specific mixer commands, then read back only
-            // controls that exist on the selected profile.
-            val stateCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
-            val cmd = "$resolvedMixerCmd; echo '=== mixer readback ==='; $stateCmd"
-            val output = RootShell.execForOutput(cmd, timeoutMs = 8000)
+            // Keep the SIP-answer critical path limited to exact profile
+            // controls. Full tinymix diagnostics run independently from
+            // logCaptureDiagnostics() and must not block the 200 response.
+            val output = RootShell.execForOutput(resolvedMixerCmd, timeoutMs = 2000)
             val msg = "Mixer incall_music: $output"
             Log.i(TAG, msg)
             listener?.onRtpStats(msg)
@@ -1377,7 +1363,7 @@ class RtpSession(
                         // established (Madera codec, SLIMTX, HPOUT, DSP, ASRC).
 
                         // Phase 6: Delayed re-check (5s) — see if routing changes
-                        // after enableIncallMusic/enableIncallMusicViaMixer run.
+                        // after enableIncallMusic/applyIncallMusicMixer run.
                         Thread.sleep(5000)
                         if (running.get()) {
                             val recheck = "echo '=== mixer re-check (t+5s) ==='; $routingCmd"

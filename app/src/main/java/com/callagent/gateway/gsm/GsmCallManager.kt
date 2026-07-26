@@ -472,19 +472,11 @@ object GsmCallManager {
             return
         }
         try {
-            val stateCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
-            // Step 1: Read back the controls relevant to this device.
-            val before = RootShell.execForOutput(stateCmd, timeoutMs = 8000)
-            appLog("Mixer BEFORE: $before")
-
-            // Step 2: Run mixer setup commands (all ABOX controls on card 0)
-            // Use execForOutput to capture discovery/diagnostic output from setup commands
-            val setupOutput = RootShell.execForOutput(resolvedSetup, timeoutMs = 8000)
+            // Re-assert the exact controls after the route settles. Full
+            // tinymix dumps are already collected asynchronously by discovery
+            // and RTP diagnostics; serializing them here delays media startup.
+            val setupOutput = RootShell.execForOutput(resolvedSetup, timeoutMs = 3000)
             if (setupOutput.isNotBlank()) appLog("Mixer setup: $setupOutput")
-
-            // Step 3: Readback AFTER — verify controls were actually changed.
-            val readback = RootShell.execForOutput(stateCmd, timeoutMs = 10000)
-            appLog("Mixer AFTER: $readback")
         } catch (e: Exception) {
             appLog("Mixer setup FAILED: ${e.message}")
         }

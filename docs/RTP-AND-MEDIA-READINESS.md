@@ -1,6 +1,6 @@
 # RTP 与媒体就绪
 
-本文描述 gsm2sip `2.8.66` 的 RTP 接收时间线，以及 SIP 接通前的媒体就绪边界。
+本文描述 gsm2sip `2.8.67` 的 RTP 接收时间线，以及 SIP 接通前的媒体就绪边界。
 
 ## 固定媒体格式
 
@@ -35,6 +35,14 @@ RTP 解析会处理 CSRC、扩展头和 padding。payload type 或净负载长�
 2. RTP socket 和播放线程已启动；
 3. `AudioTrack` 可写；
 4. `AudioRecord` 至少产生一帧捕获数据。
+
+外拨 INVITE 已携带远端 RTP 地址，因此 CallAgent 会在 Telecom 建立拨号音频用例后
+主动预热 AppOps、AudioRecord、AudioTrack 和 RTP socket，而不再只依赖可能缺失的
+`DIALING` 回调。GSM 进入 `ACTIVE` 后只重设必要的 incall_music 控件并等待一帧
+ACTIVE 之后的捕获数据；全量 mixer 诊断在后台执行，不阻塞 SIP 200 OK。
+
+所有 GSM/SIP 拨号超时都绑定到通话代次和对应 SIP 通话对象。上一通遗留的延迟任务
+无法结束下一通快速重拨。
 
 `X-WPhone-Media-Ready` 和 `X-CallAgent-Media-Ready` 仅用于日志诊断。当前
 Asterisk dialplan 不保证跨两条呼叫腿复制任意自定义响应头，通话正确性不能依赖
