@@ -268,7 +268,9 @@ data class DeviceProfile(
             musicVolPercent = 25,
             captureGain = 2,
             playbackGain = 2,
-            noiseGateThreshold = 120,
+            // Digital downlink prompts can start around RMS 20-100.  Keeping
+            // the old 120 gate converted valid early call audio to PCMA silence.
+            noiseGateThreshold = 20,
             echoGateThreshold = 300,
             doubleTalkRatio = 1.5f,
             requireSpeakerMode = true,

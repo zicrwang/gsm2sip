@@ -110,7 +110,7 @@ class RtpSession(
     // (when decayingPlaybackRms <= echoGateThreshold) to avoid false resets
     // from incall_music echo leaking back through VOICE_CALL capture.
     private val SILENCE_RMS_THRESHOLD = 10   // Below this = truly dead source (ADC noise floor)
-    private val SILENCE_FRAME_LIMIT = 25     // 25 non-echo frames (~0.5s) — fast fallback for testing
+    private val SILENCE_FRAME_LIMIT = 150    // 150 non-echo frames (~3s) before changing source
 
     var listener: Listener? = null
 
@@ -122,8 +122,8 @@ class RtpSession(
         fun onRtpStats(stats: String) {}  // Periodic detailed stats
     }
 
-    fun start() {
-        if (running.getAndSet(true)) return
+    fun start(): Boolean {
+        if (running.getAndSet(true)) return true
         Log.i(TAG, "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType")
 
         try {
@@ -137,12 +137,14 @@ class RtpSession(
             Log.e(TAG, "Failed to bind RTP socket on port $localPort: ${e.message}")
             running.set(false)
             listener?.onRtpError("Socket bind failed: ${e.message}")
-            return
+            return false
         }
 
         if (!initAudio()) {
             running.set(false)
-            return
+            socket?.close()
+            socket = null
+            return false
         }
 
         // Send initial RTP keepalive to punch NAT pinhole before audio starts
@@ -162,6 +164,7 @@ class RtpSession(
         Thread({ timeoutLoop() }, "RTP-Timeout-$localPort").start()
 
         listener?.onRtpStarted()
+        return true
     }
 
     /**

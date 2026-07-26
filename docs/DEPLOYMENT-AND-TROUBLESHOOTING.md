@@ -144,19 +144,19 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-9fd1695e2b87f5fb89dd13f5615b73ddde971e33f6c8fc1131faad94966985e1
+6e988659b7c6e9afe3c0ed54f8e89e6df46ec7c686249737d3ab7cbd2251c017
 
 gateway-magisk.zip
-4f7520f2dbaa1f7b770c2adfb5f3664b8e8294ad215c8d0ae118ecd6f72f7b4f
+e3c44e6a3f5396114b373e7d893c0c1872631109f61d0112e4a3f3b129388729
 ```
 
-APK 版本应为 `2.8.58`（versionCode `336`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.59`（versionCode `337`），并通过 APK Signature Scheme
 v2 验证。
 
-v2.8.58 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+v2.8.59 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
 incall_music 数字注入，并在桥接期间静音物理 Voice RX endpoint；挂断后
-恢复 mixer。这样 RTP 仍可取得 modem 下行，而 MI8 听筒或扬声器不再承担
-桥接播放。
+恢复 mixer。该版本还会在 SIP 200 OK 前完成 RTP/音频初始化，降低数字下行
+噪声门限，并延长静音源判定窗口，避免外拨接通后的开头语音被静音或误切源。
 
 ## 7. 仍需在设备端完成的事项
 

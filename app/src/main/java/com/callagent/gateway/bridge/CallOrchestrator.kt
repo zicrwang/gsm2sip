@@ -247,7 +247,10 @@ class CallOrchestrator(
 
                 if (addr != null && port > 0) {
                     Thread({
-                        startRtp(localPort, addr, port, pt)
+                        if (!startRtp(localPort, addr, port, pt)) {
+                            tearDown("RTP setup failed")
+                            return@Thread
+                        }
                         // Guard: tearDown may have run while startRtp was blocking
                         // (AudioRecord retries take 30+ seconds on cold boot).
                         // Don't overwrite IDLE — that causes "Busy" on next call.
@@ -275,25 +278,44 @@ class CallOrchestrator(
                     listener?.onStateChanged(bridgeState, "GSM answered, calling Asterisk")
                     Thread({ handleInboundFlow(call) }, "SIP-OutCall").start()
                 } else {
-                    // SIP-initiated OUTBOUND flow: GSM destination answered → start audio bridge
-                    bridgeState = BridgeState.BRIDGED
-                    listener?.onStateChanged(bridgeState, "Bridged (outbound)")
-
-                    // Answer the SIP call off the main thread
+                    // SIP-initiated OUTBOUND flow: GSM destination answered.
+                    // Prepare media before sending SIP 200 OK so the remote
+                    // party never enters an answered call with no RTP source.
                     Thread({
-                        activeSipCall?.let { sipCall ->
-                            val rtpPort = allocateRtpPort()
-                            sipCall.listener = this
-                            sipCall.accept(rtpPort)
-
-                            val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
-                            val port = sipCall.remoteRtpPort
-                            val pt = sipCall.negotiatedPayloadType
-                            if (port > 0) {
-                                startRtp(rtpPort, addr, port, pt)
-                            }
+                        val sipCall = activeSipCall
+                        if (sipCall == null) {
+                            Log.e(TAG, "GSM answered but the SIP call is no longer active")
+                            tearDown("SIP call disappeared")
+                            return@Thread
                         }
-                        Log.i(TAG, "Outbound bridge established")
+                        val rtpPort = allocateRtpPort()
+                        sipCall.listener = this
+                        val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
+                        val port = sipCall.remoteRtpPort
+                        val pt = sipCall.negotiatedPayloadType
+
+                        if (port <= 0) {
+                            Log.e(TAG, "Cannot answer outbound SIP call: missing remote RTP port")
+                            tearDown("Missing SIP RTP endpoint")
+                            return@Thread
+                        }
+
+                        Log.i(TAG, "GSM answered — preparing RTP before SIP 200 OK")
+                        if (!startRtp(rtpPort, addr, port, pt)) {
+                            tearDown("RTP setup failed")
+                            return@Thread
+                        }
+                        if (activeSipCall !== sipCall ||
+                            bridgeState == BridgeState.IDLE ||
+                            bridgeState == BridgeState.TEARING_DOWN) {
+                            Log.w(TAG, "Call ended while RTP was starting — skipping SIP answer")
+                            return@Thread
+                        }
+
+                        sipCall.accept(rtpPort)
+                        bridgeState = BridgeState.BRIDGED
+                        listener?.onStateChanged(bridgeState, "Bridged (outbound)")
+                        Log.i(TAG, "Outbound bridge established with media ready")
                     }, "SIP-Bridge").start()
                 }
             }
@@ -360,7 +382,10 @@ class CallOrchestrator(
                 Log.i(TAG, "SIP answered (codec=$codecName) — GSM already active, starting RTP now")
                 val localRtpPort = call.localRtpPort
                 Thread({
-                    startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)
+                    if (!startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)) {
+                        tearDown("RTP setup failed")
+                        return@Thread
+                    }
                     if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) {
                         Log.w(TAG, "Bridge torn down during RTP setup — not transitioning to BRIDGED")
                         return@Thread
@@ -386,7 +411,10 @@ class CallOrchestrator(
             // Edge case: GSM was already answered (e.g. user picked up manually)
             // before SIP was ready.  Start RTP now.
             val localRtpPort = call.localRtpPort
-            startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)
+            if (!startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)) {
+                tearDown("RTP setup failed")
+                return
+            }
             bridgeState = BridgeState.BRIDGED
             listener?.onStateChanged(bridgeState, "Bridged (inbound)")
             Log.i(TAG, "Bridge established (codec=$codecName)")
@@ -466,7 +494,7 @@ class CallOrchestrator(
     // ── RTP ─────────────────────────────────────────────
 
     private fun startRtp(localPort: Int, remoteAddr: String, remotePort: Int,
-                         payloadType: Int = RtpPacket.PT_PCMA) {
+                         payloadType: Int = RtpPacket.PT_PCMA): Boolean {
         // Re-assert RECORD_AUDIO appops SYNCHRONOUSLY before AudioRecord
         // creation.  Must complete before RtpSession.start() so AudioFlinger
         // sees "allow" when the record thread begins reading.  Running async
@@ -497,11 +525,16 @@ class CallOrchestrator(
             }
         }
         activeRtpSession = session
-        session.start()
+        if (!session.start()) {
+            if (activeRtpSession === session) activeRtpSession = null
+            return false
+        }
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) {
             session.stop()
             if (activeRtpSession === session) activeRtpSession = null
+            return false
         }
+        return true
     }
 
     // ── Teardown ────────────────────────────────────────
