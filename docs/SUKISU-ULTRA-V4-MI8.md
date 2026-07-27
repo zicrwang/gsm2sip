@@ -50,8 +50,8 @@ export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=10808 -Dhttps.pr
 ```
 
 测试覆盖 RTP 扩展头/填充解析、乱序、重复包、丢包、序列号回绕、SSRC 切换和
-缓冲溢出和 RFC2833 PT=101 结束包去重。当前发布版本应为 `2.8.71`
-（versionCode `349`）。
+缓冲溢出、RFC2833 PT=101 结束包去重及入站对话 BYE 头方向。当前发布版本应为
+`2.8.72`（versionCode `350`）。
 
 Release APK 必须经过签名。当前私有设备构建使用编译机上固定的 Android debug
 keystore，便于后续版本使用同一签名升级；该签名不适合公开发行。
@@ -154,6 +154,7 @@ adb -s 192.168.2.82:5555 shell \
 - 正常静音只记录限频日志；禁止切换到 `VOICE_CALL`、
   `VOICE_RECOGNITION`、`MIC` 或 `VOICE_COMMUNICATION`
 - AudioRecord 硬故障只重建同一数字源，连续三次失败后同时挂断 SIP 和 GSM
+- GSM 先挂断时按入站 SIP 对话方向发送 BYE，并携带本端和远端 dialog tag
 - 使用 SDM845/Tavil 对应的 mixer 诊断，而不是 Samsung ABOX 控件
 
 最终仍需通过一次真实 GSM 与 SIP 双向通话验证上下行声音、增益和回声参数。

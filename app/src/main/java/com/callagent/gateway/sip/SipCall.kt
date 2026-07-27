@@ -279,19 +279,47 @@ class SipCall(
     fun hangup() {
         if (state == State.TERMINATED) return
         val uri = remoteContactUri ?: "sip:${sipClient.serverDomain}:${sipClient.serverPort}"
+        val headers = localRequestDialogHeaders(direction, fromHeader, toHeader, localTag)
 
         val bye = SipBuilder.bye(
-            uri, fromHeader, toHeader,
+            uri, headers.from, headers.to,
             callId, localCseq++,
             sipClient.username, sipClient.publicIp, sipClient.localPort
         )
         sipClient.sendResponse(bye, remoteContactAddress ?: sipClient.serverAddress)
         state = State.TERMINATED
-        Log.i(TAG, "Sent BYE for call $callId")
+        Log.i(
+            TAG,
+            "Sent BYE for call $callId direction=$direction " +
+                "localTag=$localTag remoteTag=${remoteTag ?: "missing"}"
+        )
         listener?.onCallTerminated(this)
     }
 
     companion object {
         private const val TAG = "SipCall"
     }
+}
+
+internal data class SipDialogHeaders(val from: String?, val to: String?)
+
+/** Headers for a request originated by this gateway inside an established dialog. */
+internal fun localRequestDialogHeaders(
+    direction: SipCall.Direction,
+    inviteFrom: String?,
+    inviteTo: String?,
+    localTag: String,
+): SipDialogHeaders = when (direction) {
+    SipCall.Direction.OUTBOUND -> SipDialogHeaders(inviteFrom, inviteTo)
+    SipCall.Direction.INBOUND -> SipDialogHeaders(
+        from = inviteTo.withDialogTag(localTag),
+        to = inviteFrom,
+    )
+}
+
+private fun String?.withDialogTag(tag: String): String? {
+    if (this == null || Regex("(?:^|;)\\s*tag=", RegexOption.IGNORE_CASE).containsMatchIn(this)) {
+        return this
+    }
+    return "$this;tag=$tag"
 }
