@@ -12,6 +12,7 @@ import android.media.MediaRecorder
 import android.os.SystemClock
 import android.os.Process
 import android.util.Log
+import com.callagent.gateway.CaptureSourceKind
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.gsm.GsmCallManager
@@ -21,6 +22,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -53,9 +55,12 @@ class RtpSession(
     private val appOpsPropagationDelayMs: Long? = null,
 ) {
     private val running = AtomicBoolean(false)
+    private val workerThreads = CopyOnWriteArrayList<Thread>()
+    private val workerThreadLock = Any()
+    private val finalStatsReported = AtomicBoolean(false)
     private var socket: DatagramSocket? = null
-    private var audioRecord: AudioRecord? = null
-    private var audioTrack: AudioTrack? = null
+    @Volatile private var audioRecord: AudioRecord? = null
+    @Volatile private var audioTrack: AudioTrack? = null
 
     // Codec
     private val g722Encoder = G722Codec()
@@ -106,6 +111,8 @@ class RtpSession(
     @Volatile private var postConnectDiagnosticsEnabled = false
     private val captureDiagnosticsStarted = AtomicBoolean(false)
     private val injectionPreparationStarted = AtomicBoolean(false)
+    private val captureFatalReported = AtomicBoolean(false)
+    @Volatile private var terminalReason = "stopped"
     @Volatile private var sipToGsmReady = false
     @Volatile private var sipToGsmError: String? = null
     private val captureFrameLock = Object()
@@ -120,19 +127,35 @@ class RtpSession(
     // Audio session ID from AudioRecord (for logging/diagnostics)
     private var audioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
 
-    // Silence detection: track audio source IDs that produce no audio so we
-    // can fall back to alternatives.  E.g., VOICE_CALL initializes on
-    // Exynos 9820 but delivers silence — the HAL doesn't route voice data
-    // to the capture path.  Falling back to MIC captures the caller's voice
-    // acoustically from the speaker.
-    private val silentSourceIds = mutableSetOf<Int>()
-    @Volatile private var currentSourceId: Int = -1
     private data class SourceConfig(val source: Int, val name: String, val rate: Int)
-    // Silence detection thresholds — only counted during non-echo periods
-    // (when decayingPlaybackRms <= echoGateThreshold) to avoid false resets
-    // from incall_music echo leaking back through VOICE_CALL capture.
-    private val SILENCE_RMS_THRESHOLD = 10   // Below this = truly dead source (ADC noise floor)
-    private val SILENCE_FRAME_LIMIT = 150    // 150 non-echo frames (~3s) before changing source
+    @Volatile private var pinnedCaptureConfig: SourceConfig? = null
+
+    private sealed class CaptureLoopResult {
+        data object Stopped : CaptureLoopResult()
+        data class HardFailure(val reason: String) : CaptureLoopResult()
+    }
+
+    private data class SessionStatsSnapshot(
+        val tx: Long,
+        val rx: Long,
+        val writes: Long,
+        val captureRms: Int,
+        val rawCaptureRms: Int,
+        val playbackRms: Int,
+        val source: String,
+        val captureRate: Int,
+        val playbackRate: Int,
+        val jitter: RtpJitterBuffer.Stats,
+        val dtmf: Long,
+        val gsmToSipReady: Boolean,
+        val sipToGsmReady: Boolean,
+        val sipToGsmError: String?,
+        val echoGated: Long,
+        val noiseGated: Long,
+        val forwarded: Long,
+        val doubleTalk: Long,
+        val echoGain: Float,
+    )
 
     var listener: Listener? = null
 
@@ -140,6 +163,7 @@ class RtpSession(
         fun onRtpStarted()
         fun onRtpStopped()
         fun onRtpError(error: String)
+        fun onCaptureFatal(error: String) {}
         fun onRtpTimeout() {}  // No RTP received for RTP_TIMEOUT_MS
         fun onRtpStats(stats: String) {}  // Periodic detailed stats
     }
@@ -194,13 +218,28 @@ class RtpSession(
         }
 
         lastRtpReceivedTime = System.currentTimeMillis()
-        Thread({ receiveLoop() }, "RTP-Recv-$localPort").start()
-        Thread({ playbackLoop() }, "RTP-Play-$localPort").start()
-        Thread({ captureInitAndLoop() }, "RTP-Capt-$localPort").start()
-        Thread({ timeoutLoop() }, "RTP-Timeout-$localPort").start()
+        startSessionThread("RTP-Recv-$localPort") { receiveLoop() }
+        startSessionThread("RTP-Play-$localPort") { playbackLoop() }
+        startSessionThread("RTP-Capt-$localPort") { captureInitAndLoop() }
+        startSessionThread("RTP-Timeout-$localPort") { timeoutLoop() }
 
         listener?.onRtpStarted()
         return true
+    }
+
+    private fun startSessionThread(name: String, block: () -> Unit) {
+        val thread = Thread({
+            try {
+                block()
+            } finally {
+                workerThreads.remove(Thread.currentThread())
+            }
+        }, name)
+        synchronized(workerThreadLock) {
+            if (!running.get()) return
+            workerThreads.add(thread)
+            thread.start()
+        }
     }
 
     /**
@@ -236,10 +275,13 @@ class RtpSession(
 
     private fun startSipToGsmPreparation() {
         if (!injectionPreparationStarted.compareAndSet(false, true)) return
-        Thread({
+        startSessionThread("RTP-Injection-$localPort") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            if (!running.get()) return@startSessionThread
             val halReady = enableIncallMusic()
+            if (!running.get()) return@startSessionThread
             val mixerReady = applyIncallMusicMixer()
+            if (!running.get()) return@startSessionThread
             val ready = halReady && mixerReady
             sipToGsmReady = ready
             if (!ready) {
@@ -248,7 +290,7 @@ class RtpSession(
             } else {
                 Log.i(TAG, "SIP-to-GSM injection ready")
             }
-        }, "RTP-Injection-$localPort").start()
+        }
     }
 
     fun markSignalingConnected() {
@@ -280,7 +322,6 @@ class RtpSession(
         val configs = buildCaptureConfigs()
 
         var record: AudioRecord? = null
-        var usedSource = "none"
         var usedRate = 8000
 
         // Retry loop: cold boot can cause OP_RECORD_AUDIO denial even
@@ -317,10 +358,9 @@ class RtpSession(
                     )
                     if (rec.state == AudioRecord.STATE_INITIALIZED) {
                         record = rec
-                        usedSource = cfg.name
                         usedRate = cfg.rate
                         audioSourceName = cfg.name
-                        currentSourceId = cfg.source
+                        pinnedCaptureConfig = cfg
                         Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize, attempt=$attempt)")
                         break
                     } else {
@@ -409,19 +449,7 @@ class RtpSession(
         return true
     }
 
-    /**
-     * Initialize AudioRecord with retries, then run the capture loop.
-     *
-     * On cold boot, AudioFlinger refuses to create record tracks for
-     * 10-30+ seconds after the voice call starts ("could not create record
-     * track, status: -1").  The audio HAL needs time to fully initialize
-     * the recording infrastructure after the modem voice path starts.
-     *
-     * Playback (SIP→GSM via incall_music) runs in a separate thread and
-     * starts immediately.  This method retries capture init for up to 30s
-     * so the caller hears the agent right away, even if the reverse
-     * direction (GSM→SIP) takes longer to come up.
-     */
+    /** Initialize capture, pin the selected source, and recover only that source. */
     private fun captureInitAndLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         try {
@@ -432,128 +460,148 @@ class RtpSession(
         }
         if (!running.get()) return
 
-        // Fast path: AudioRecord was already initialized in initAudio (warm boot)
-        if (audioRecord != null) {
-            if (captureLoop() || !running.get()) return
-            // Source produced silence for 3s — fall through to try alternatives
-            Log.w(TAG, "Primary source $audioSourceName silent, searching for working source (skip: $silentSourceIds)")
+        val defaultRemoteInet = try {
+            InetAddress.getByName(remoteAddr)
+        } catch (e: Exception) {
+            reportCaptureFatal("remote-address:${e.message}", 0)
+            return
         }
+        var hardFailureAttempts = 0
 
-        // Deferred/fallback source finding + capture loop.
-        // Rebuilds the source list each iteration, excluding sources detected
-        // as silent.  This handles both cold-boot AudioRecord unavailability
-        // AND sources that initialize but deliver no audio (e.g., VOICE_CALL
-        // on Exynos 9820 where the HAL doesn't route voice data to capture).
-        val defaultRemoteInet = InetAddress.getByName(remoteAddr)
-        val maxFallbacks = 5  // Maximum silent-source fallback cycles
-
-        for (fallback in 0 until maxFallbacks) {
-            if (!running.get()) return
-
-            // Build source list, filtering out sources that produced silence
-            val configs = buildCaptureConfigs()
-            if (configs.isEmpty()) {
-                Log.e(TAG, "All capture sources produced silence — no working source found")
-                break
-            }
-
-            if (fallback > 0 || audioRecord == null) {
-                Log.w(TAG, "Trying capture sources (fallback=$fallback): ${configs.joinToString { it.name }} (silent: $silentSourceIds)")
-            }
-
-            // Try to initialize AudioRecord with one of the remaining sources
-            val maxAttempts = if (fallback == 0 && audioRecord == null) 15 else 3
-            var sourceFound = false
-
-            for (attempt in 1..maxAttempts) {
-                if (!running.get()) return
-
-                val authorizationWasPrepared = appOpsPropagationDelayMs != null
-                if (!(fallback == 0 && attempt == 1 && authorizationWasPrepared)) {
-                    reAssertAppOps()
-                    sendSilencePackets(500, defaultRemoteInet)
-                } else {
-                    Log.i(TAG, "Reusing prepared RECORD_AUDIO authorization for active capture")
-                }
-
-                for (cfg in configs) {
-                    if (cfg.source in silentSourceIds) continue
-                    try {
-                        val minBuf = AudioRecord.getMinBufferSize(
-                            cfg.rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-                        )
-                        if (minBuf <= 0) continue
-                        val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2)
-                        val rec = AudioRecord(
-                            cfg.source, cfg.rate,
-                            AudioFormat.CHANNEL_IN_MONO,
-                            AudioFormat.ENCODING_PCM_16BIT,
-                            bufSize
-                        )
-                        if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                            if (!running.get()) { rec.release(); return }
-                            audioRecord = rec
-                            audioSessionId = rec.audioSessionId
-                            captureRate = cfg.rate
-                            audioSourceName = cfg.name
-                            currentSourceId = cfg.source
-                            Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize, fallback=$fallback attempt=$attempt)")
-                            maybeStartCaptureDiagnostics()
-                            sourceFound = true
-                            break
-                        } else {
-                            Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: state=${rec.state}")
-                            rec.release()
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} failed: ${e.message}")
-                    }
-                }
-
-                if (sourceFound) break
-
-                if (attempt < maxAttempts && running.get()) {
-                    Log.w(TAG, "All remaining sources failed (fallback=$fallback attempt=$attempt/$maxAttempts), retrying in 2s")
-                    sendSilencePackets(2000, defaultRemoteInet)
-                }
-            }
-
-            if (!sourceFound) {
-                Log.e(TAG, "Could not initialize any remaining capture source")
-                break
-            }
-
-            // Run capture loop — returns false if silence detected
-            Log.i(TAG, "Capture ready (fallback=$fallback), starting capture loop with $audioSourceName")
-            if (captureLoop() || !running.get()) return
-            // Silence detected — silentSourceIds updated, loop again with remaining sources
-            Log.w(TAG, "Source $audioSourceName silent after 3s (skip: $silentSourceIds), trying next fallback")
-        }
-
-        // All sources exhausted — DON'T tear down the call.  Playback
-        // (SIP→GSM via incall_music) still works if we keep NAT alive.
-        // Continue sending silence RTP so the caller at least hears the agent.
-        Log.e(TAG, "All capture sources exhausted — capture disabled, keeping NAT alive for playback")
         while (running.get()) {
-            sendSilencePackets(5000, defaultRemoteInet)
+            if (audioRecord == null) {
+                val configs = pinnedCaptureConfig?.let(::listOf) ?: buildCaptureConfigs()
+                if (!initializeCaptureRecord(configs, defaultRemoteInet)) {
+                    if (running.get()) {
+                        reportCaptureFatal(
+                            "AudioRecord initialization failed",
+                            CAPTURE_INIT_ATTEMPTS,
+                        )
+                    }
+                    return
+                }
+            }
+
+            Log.i(TAG, "Capture ready, starting pinned source=$audioSourceName")
+            when (val result = captureLoop()) {
+                CaptureLoopResult.Stopped -> return
+                is CaptureLoopResult.HardFailure -> {
+                    if (!running.get()) return
+                    hardFailureAttempts++
+                    releaseCaptureRecord()
+                    val retryMessage = "Capture hard failure source=$audioSourceName " +
+                        "reason=${result.reason} attempt=$hardFailureAttempts/$CAPTURE_RESTART_LIMIT"
+                    Log.e(TAG, retryMessage)
+                    listener?.onRtpStats(retryMessage)
+                    if (hardFailureAttempts >= CAPTURE_RESTART_LIMIT) {
+                        reportCaptureFatal(result.reason, hardFailureAttempts)
+                        return
+                    }
+                    sendSilencePackets(CAPTURE_RESTART_DELAY_MS, defaultRemoteInet)
+                }
+            }
         }
     }
 
-    /** Build the prioritized list of capture source configs, excluding
-     *  sources already detected as silent. */
-    private fun buildCaptureConfigs(): List<SourceConfig> {
-        val configs = mutableListOf<SourceConfig>()
-        // Real devices with a verified telephony-recording path get clean
-        // digital downlink first. Unknown devices stay on ordinary inputs,
-        // since unsupported telephony sources often initialize as silence.
-        if (profile.preferTelephonyCapture) {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
+    private fun initializeCaptureRecord(
+        configs: List<SourceConfig>,
+        defaultRemoteInet: InetAddress,
+    ): Boolean {
+        for (attempt in 1..CAPTURE_INIT_ATTEMPTS) {
+            if (!running.get()) return false
+            if (!(attempt == 1 && appOpsPropagationDelayMs != null)) {
+                reAssertAppOps()
+                if (!running.get()) return false
+            }
+
+            for (cfg in configs) {
+                try {
+                    val minBuf = AudioRecord.getMinBufferSize(
+                        cfg.rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                    )
+                    if (minBuf <= 0) continue
+                    val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2)
+                    val rec = AudioRecord(
+                        cfg.source, cfg.rate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufSize
+                    )
+                    if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                        Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: state=${rec.state}")
+                        rec.release()
+                        continue
+                    }
+                    if (!running.get()) {
+                        rec.release()
+                        return false
+                    }
+                    audioRecord = rec
+                    audioSessionId = rec.audioSessionId
+                    captureRate = cfg.rate
+                    audioSourceName = cfg.name
+                    pinnedCaptureConfig = pinnedCaptureConfig ?: cfg
+                    Log.i(
+                        TAG,
+                        "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz " +
+                            "(buf=$bufSize attempt=$attempt pinned=${pinnedCaptureConfig?.name})"
+                    )
+                    maybeStartCaptureDiagnostics()
+                    return true
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} failed: ${e.message}")
+                }
+            }
+
+            if (attempt < CAPTURE_INIT_ATTEMPTS && running.get()) {
+                sendSilencePackets(CAPTURE_RESTART_DELAY_MS, defaultRemoteInet)
+            }
         }
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
-        return configs.filterNot { it.source in silentSourceIds }
+        return false
+    }
+
+    private fun releaseCaptureRecord() {
+        val record = audioRecord
+        audioRecord = null
+        if (record != null) {
+            try { record.stop() } catch (_: Exception) {}
+            try { record.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun reportCaptureFatal(reason: String, attempts: Int) {
+        if (!captureFatalReported.compareAndSet(false, true)) return
+        terminalReason = "capture-fatal"
+        val lastFrameAgoMs = lastCaptureFrameElapsed.takeIf { it > 0L }
+            ?.let { (SystemClock.elapsedRealtime() - it).coerceAtLeast(0L) } ?: -1L
+        val message = "Capture fatal source=$audioSourceName reason=$reason " +
+            "attempts=$attempts lastFrameAgoMs=$lastFrameAgoMs action=hangup"
+        Log.e(TAG, message)
+        listener?.onRtpStats(message)
+        listener?.onCaptureFatal(message)
+    }
+
+    /** Build the capture sources allowed during initial selection. */
+    private fun buildCaptureConfigs(): List<SourceConfig> {
+        return profile.captureSourcePolicy.initialSources(profile.preferTelephonyCapture).map { source ->
+            when (source) {
+                CaptureSourceKind.VOICE_DOWNLINK -> SourceConfig(
+                    MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000
+                )
+                CaptureSourceKind.VOICE_CALL -> SourceConfig(
+                    MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000
+                )
+                CaptureSourceKind.VOICE_RECOGNITION -> SourceConfig(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000
+                )
+                CaptureSourceKind.MIC -> SourceConfig(
+                    MediaRecorder.AudioSource.MIC, "MIC", 8000
+                )
+                CaptureSourceKind.VOICE_COMMUNICATION -> SourceConfig(
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000
+                )
+            }
+        }
     }
 
     /**
@@ -597,38 +645,93 @@ class RtpSession(
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping RTP session on port $localPort")
 
-        audioRecord?.let {
-            try { it.stop() } catch (_: Exception) {}
-            it.release()
-        }
-        audioRecord = null
-
-        audioTrack?.let {
-            try { it.stop() } catch (_: Exception) {}
-            it.release()
-        }
-        audioTrack = null
-
-        socket?.close()
-        socket = null
-        jitterBuffer.clear()
         playbackReady.countDown()
         captureStart.countDown()
         synchronized(captureFrameLock) { captureFrameLock.notifyAll() }
 
+        val threads = synchronized(workerThreadLock) { workerThreads.toList() }
+        val current = Thread.currentThread()
+        threads.filter { it !== current }.forEach { it.interrupt() }
+
+        socket?.close()
+        socket = null
+        releaseCaptureRecord()
+
+        audioTrack?.let {
+            try { it.stop() } catch (_: Exception) {}
+            try { it.release() } catch (_: Exception) {}
+        }
+        audioTrack = null
+
+        threads.filter { it !== current }.forEach { thread ->
+            try { thread.join(WORKER_JOIN_TIMEOUT_MS) } catch (_: InterruptedException) {
+                current.interrupt()
+            }
+        }
+
+        reportFinalStats(terminalReason)
+
         listener?.onRtpStopped()
     }
 
-    // ── Capture: VOICE_CALL → echo gate → gain → encode → RTP send ──
+    private fun snapshotStats(): SessionStatsSnapshot = SessionStatsSnapshot(
+        tx = txPacketCount,
+        rx = rxPacketCount,
+        writes = playbackFrames,
+        captureRms = captureRms,
+        rawCaptureRms = rawCaptureRms,
+        playbackRms = playbackRms,
+        source = audioSourceName,
+        captureRate = captureRate,
+        playbackRate = playbackRate,
+        jitter = jitterBuffer.stats(),
+        dtmf = dtmfEventCount,
+        gsmToSipReady = lastCaptureFrameElapsed > 0,
+        sipToGsmReady = sipToGsmReady,
+        sipToGsmError = sipToGsmError,
+        echoGated = echoGatedFrames,
+        noiseGated = noiseGatedFrames,
+        forwarded = forwardedFrames,
+        doubleTalk = doubleTalkFrames,
+        echoGain = echoGainRatio,
+    )
+
+    private fun formatStats(snapshot: SessionStatsSnapshot): String {
+        val jitter = snapshot.jitter
+        return "tx=${snapshot.tx} rx=${snapshot.rx} writes=${snapshot.writes} " +
+            "capRMS=${snapshot.captureRms} rawCapRMS=${snapshot.rawCaptureRms} " +
+            "playRMS=${snapshot.playbackRms} src=${snapshot.source} " +
+            "rate=${snapshot.captureRate}/${snapshot.playbackRate} " +
+            "jbuf=${jitter.buffered}/${jitter.targetFrames}/${jitter.capacityFrames} " +
+            "jitterMs=${jitter.jitterMs} rtp:accepted=${jitter.accepted} played=${jitter.played} " +
+            "concealed=${jitter.concealed} underrun=${jitter.underruns} " +
+            "duplicate=${jitter.duplicate} reordered=${jitter.reordered} late=${jitter.late} " +
+            "overflow=${jitter.overflow} invalid=${jitter.invalid} resync=${jitter.resync} " +
+            "ssrc=${jitter.ssrcChanges} dtmf=${snapshot.dtmf} " +
+            "media:gsmToSip=${snapshot.gsmToSipReady} sipToGsm=${snapshot.sipToGsmReady} " +
+            "sipToGsmError=${snapshot.sipToGsmError ?: "none"} " +
+            "gates:echo=${snapshot.echoGated} noise=${snapshot.noiseGated} " +
+            "fwd=${snapshot.forwarded} dt=${snapshot.doubleTalk} " +
+            "echoG=${"%.2f".format(snapshot.echoGain)}"
+    }
+
+    private fun reportFinalStats(reason: String) {
+        if (!finalStatsReported.compareAndSet(false, true)) return
+        val stats = "final=true reason=$reason ${formatStats(snapshotStats())}"
+        Log.i(TAG, "RTP final: $stats")
+        listener?.onRtpStats(stats)
+    }
+
+    // ── Capture: pinned telephony source → gate → gain → encode → RTP ──
 
     // Audio parameters from device profile
     private val profile get() = GsmCallManager.profile
     private val captureGain get() = profile.captureGain
     private val playbackGain get() = profile.playbackGain
 
-    // Double-talk detection: VOICE_CALL captures uplink+downlink from
-    // the modem DSP.  The uplink contains the SIP agent's voice (injected
-    // via incall_music).  Instead of a hard echo gate (which made the
+    // Some telephony sources capture uplink+downlink from the modem DSP.
+    // The uplink contains the SIP agent's voice (injected via incall_music).
+    // Instead of a hard echo gate (which made the
     // bridge half-duplex — caller COMPLETELY silenced during agent speech),
     // we adaptively estimate the echo level and detect when the caller is
     // speaking simultaneously (double-talk / barge-in).
@@ -678,16 +781,21 @@ class RtpSession(
     private var lastCpuTicks = 0L
     private var lastCpuSampleMs = 0L
 
-    /**
-     * Capture loop: read from AudioRecord, gate, encode, send via RTP.
-     * Returns true on normal exit (call ended), false if the source was
-     * detected as silent (rawCapRMS near zero for 3 seconds) and should
-     * be replaced with a fallback source.
-     */
-    private fun captureLoop(): Boolean {
-        val record = audioRecord ?: return false
+    /** Capture from the pinned source. PCM silence is valid media, not failure. */
+    private fun captureLoop(): CaptureLoopResult {
+        val record = audioRecord
+            ?: return CaptureLoopResult.HardFailure("AudioRecord missing")
 
-        record.startRecording()
+        try {
+            record.startRecording()
+        } catch (e: Exception) {
+            return CaptureLoopResult.HardFailure("startRecording:${e.message}")
+        }
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            return CaptureLoopResult.HardFailure(
+                "recordingState=${record.recordingState} expected=${AudioRecord.RECORDSTATE_RECORDING}"
+            )
+        }
         Log.i(TAG, "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId gain=${captureGain}x profile=${profile.name} state=${record.recordingState}")
         // Also report via RTP stats so it appears in the app log viewer
         listener?.onRtpStats("Capture: source=$audioSourceName rate=$captureRate gain=${captureGain}x profile=${profile.name}")
@@ -696,12 +804,30 @@ class RtpSession(
         val samplesPerFrame = captureRate / 50  // 160 @ 8kHz, 320 @ 16kHz
         val pcmBuf = ByteArray(samplesPerFrame * 2)
         val defaultRemoteInet = InetAddress.getByName(remoteAddr)
-        var silenceFrameCount = 0
+        var lowLevelFrameCount = 0
+        var lastSuccessfulReadElapsed = SystemClock.elapsedRealtime()
 
         while (running.get()) {
+            val read = try {
+                record.read(pcmBuf, 0, pcmBuf.size)
+            } catch (e: Exception) {
+                if (!running.get()) return CaptureLoopResult.Stopped
+                return CaptureLoopResult.HardFailure("read-exception:${e.message}")
+            }
+            if (!running.get()) return CaptureLoopResult.Stopped
+            if (read < 0) {
+                return CaptureLoopResult.HardFailure("read=${audioRecordErrorName(read)}")
+            }
+            if (read == 0) {
+                val stalledMs = SystemClock.elapsedRealtime() - lastSuccessfulReadElapsed
+                if (stalledMs >= CAPTURE_READ_STALL_TIMEOUT_MS) {
+                    return CaptureLoopResult.HardFailure("read-stalled-${stalledMs}ms")
+                }
+                continue
+            }
+            lastSuccessfulReadElapsed = SystemClock.elapsedRealtime()
+
             try {
-                val read = record.read(pcmBuf, 0, pcmBuf.size)
-                if (read <= 0) continue
                 synchronized(captureFrameLock) {
                     lastCaptureFrameElapsed = SystemClock.elapsedRealtime()
                     captureFrameLock.notifyAll()
@@ -713,45 +839,30 @@ class RtpSession(
                 // captureRms=0, the echo gate is suppressing.
                 rawCaptureRms = pcmRms(pcmBuf)
 
-                // Silence detection: only count during non-echo periods (when
-                // decayingPlaybackRms <= echoGateThreshold).  incall_music echo
-                // leaks back through VOICE_CALL capture, spiking rawCapRMS
-                // above the threshold during agent speech — this would reset a
-                // naive counter even though the source delivers NO caller audio.
-                // By only counting non-echo frames, we accurately detect dead
-                // sources regardless of whether the agent is speaking.
+                // Low energy can be a normal remote pause. Keep the pinned source
+                // and emit a rate-limited diagnostic instead of changing inputs.
                 val noEchoPeriod = decayingPlaybackRms <= echoGateThreshold
-                if (noEchoPeriod) {
-                    if (rawCaptureRms < SILENCE_RMS_THRESHOLD) {
-                        silenceFrameCount++
-                        if (silenceFrameCount == 10 || silenceFrameCount == 20) {
-                            Log.w(TAG, "Source $audioSourceName low audio (no-echo): rawCapRMS=$rawCaptureRms silence=${silenceFrameCount}/${SILENCE_FRAME_LIMIT} frames")
-                        }
-                        if (silenceFrameCount >= SILENCE_FRAME_LIMIT) {
-                            val msg = "Source $audioSourceName SILENT ($silenceFrameCount non-echo frames) — trying fallback"
-                            Log.w(TAG, msg)
-                            listener?.onRtpStats(msg)
-                            silentSourceIds.add(currentSourceId)
-                            try { record.stop() } catch (_: Exception) {}
-                            record.release()
-                            audioRecord = null
-                            return false  // Signal: try another source
-                        }
-                    } else {
-                        silenceFrameCount = 0  // Source delivered audio during non-echo → working
+                if (noEchoPeriod && rawCaptureRms < LOW_LEVEL_RMS_THRESHOLD) {
+                    lowLevelFrameCount++
+                    if (lowLevelFrameCount == LOW_LEVEL_LOG_FRAMES ||
+                        lowLevelFrameCount % LOW_LEVEL_PERIODIC_LOG_FRAMES == 0) {
+                        val msg = "Capture low-level source=$audioSourceName rawCapRMS=$rawCaptureRms " +
+                            "frames=$lowLevelFrameCount action=retain-source"
+                        Log.i(TAG, msg)
+                        listener?.onRtpStats(msg)
                     }
+                } else if (noEchoPeriod) {
+                    lowLevelFrameCount = 0
                 }
-                // During echo periods: don't update counter (can't distinguish
-                // caller audio from incall_music echo)
 
                 // Double-talk-aware gating: replaces the old hard echo gate
                 // that made the bridge half-duplex (caller completely silenced
                 // during agent speech).  Now uses adaptive echo level estimation
                 // to detect when the caller is speaking over the agent.
                 //
-                // VOICE_CALL captures uplink+downlink.  incall_music injects
-                // the agent's voice digitally into the uplink with a consistent
-                // gain ratio.  We track that ratio and detect when capture energy
+                // Mixed telephony sources can include incall_music from the
+                // uplink with a consistent gain ratio. We track that ratio and
+                // detect when capture energy
                 // exceeds the expected echo — that excess is the caller's voice.
                 // Update decaying echo reference: tracks playback level
                 // through brief inter-word gaps to suppress echo tails.
@@ -851,7 +962,15 @@ class RtpSession(
                 if (running.get()) Log.e(TAG, "Capture error: ${e.message}")
             }
         }
-        return true  // Normal exit (call ended)
+        return CaptureLoopResult.Stopped
+    }
+
+    private fun audioRecordErrorName(error: Int): String = when (error) {
+        AudioRecord.ERROR_DEAD_OBJECT -> "ERROR_DEAD_OBJECT($error)"
+        AudioRecord.ERROR_INVALID_OPERATION -> "ERROR_INVALID_OPERATION($error)"
+        AudioRecord.ERROR_BAD_VALUE -> "ERROR_BAD_VALUE($error)"
+        AudioRecord.ERROR -> "ERROR($error)"
+        else -> error.toString()
     }
 
     // ── Receive: RTP recv → jitter buffer ───────────────
@@ -900,22 +1019,24 @@ class RtpSession(
         // when screen is off, and re-toggle incall_music after speaker route
         // is fully settled (~1.5s after configureAudioBridge).
         try { Thread.sleep(3_000) } catch (_: InterruptedException) { return }
+        var lastAppOpsElapsed = SystemClock.elapsedRealtime()
         if (running.get()) {
             reAssertAppOps()
-            reToggleIncallMusic()
+            lastAppOpsElapsed = SystemClock.elapsedRealtime()
+            if (running.get()) reToggleIncallMusic()
         }
 
         while (running.get()) {
             try {
-                // 15s interval (was 5s) — each appops su call spawns a JVM
-                // (~500ms on MSM8930).  15s is sufficient to catch screen-off
-                // revocations while reducing CPU load by 3x.
-                Thread.sleep(15_000)
+                Thread.sleep(STATS_INTERVAL_MS)
+                if (!running.get()) break
 
-                // Periodic appops re-assertion: Android's AppOpsService
-                // re-revokes RECORD_AUDIO for background apps when screen
-                // is off.  Re-asserting periodically keeps capture alive.
-                reAssertAppOps()
+                val nowElapsed = SystemClock.elapsedRealtime()
+                if (nowElapsed - lastAppOpsElapsed >= APP_OPS_INTERVAL_MS) {
+                    reAssertAppOps()
+                    if (!running.get()) break
+                    lastAppOpsElapsed = SystemClock.elapsedRealtime()
+                }
 
                 // Log detailed stats every 5s
                 val extraInfo = buildString {
@@ -935,21 +1056,16 @@ class RtpSession(
                 } catch (_: Exception) { "" }
                 // CPU/memory/thread diagnostics
                 val cpuInfo = getCpuStats()
-                val jitterStats = jitterBuffer.stats()
-                val stats = "tx=$txPacketCount rx=$rxPacketCount writes=$playbackFrames " +
-                        "capRMS=$captureRms rawCapRMS=$rawCaptureRms playRMS=$playbackRms src=$audioSourceName " +
-                        "rate=${captureRate}/${playbackRate} jbuf=${jitterStats.buffered}/${jitterStats.targetFrames}/${jitterStats.capacityFrames} jitterMs=${jitterStats.jitterMs} " +
-                        "rtp:accepted=${jitterStats.accepted} played=${jitterStats.played} " +
-                        "concealed=${jitterStats.concealed} underrun=${jitterStats.underruns} " +
-                        "duplicate=${jitterStats.duplicate} reordered=${jitterStats.reordered} " +
-                        "late=${jitterStats.late} overflow=${jitterStats.overflow} " +
-                        "invalid=${jitterStats.invalid} resync=${jitterStats.resync} ssrc=${jitterStats.ssrcChanges} " +
-                        "dtmf=$dtmfEventCount " +
-                        "media:gsmToSip=${lastCaptureFrameElapsed > 0} sipToGsm=$sipToGsmReady sipToGsmError=${sipToGsmError ?: "none"} " +
-                        "gates:echo=$echoGatedFrames noise=$noiseGatedFrames fwd=$forwardedFrames dt=$doubleTalkFrames echoG=${"%.2f".format(echoGainRatio)}" +
-                        "$cpuInfo$volInfo" + extraInfo
+                val stats = formatStats(snapshotStats()) + "$cpuInfo$volInfo" + extraInfo
                 Log.i(TAG, "RTP: $stats")
                 listener?.onRtpStats(stats)
+
+                val captureFrameAgeMs = SystemClock.elapsedRealtime() - lastCaptureFrameElapsed
+                if (signalingConnected && audioRecord != null && lastCaptureFrameElapsed > 0L &&
+                    captureFrameAgeMs >= CAPTURE_FRAME_TIMEOUT_MS) {
+                    reportCaptureFatal("frame-stalled-${captureFrameAgeMs}ms", 0)
+                    break
+                }
 
                 val elapsed = System.currentTimeMillis() - lastRtpReceivedTime
                 if (signalingConnected && elapsed > RTP_TIMEOUT_MS) {
@@ -1212,6 +1328,7 @@ class RtpSession(
             }
             return true
         } catch (e: Exception) {
+            if (!running.get()) return false
             Log.w(TAG, "Failed to set incall_music_enabled: ${e.message}")
             listener?.onRtpStats("incall_music FAILED: ${e.message}")
             return false
@@ -1220,6 +1337,7 @@ class RtpSession(
 
     /** Apply only the essential injection writes on an independent root channel. */
     private fun applyIncallMusicMixer(): Boolean {
+        if (!running.get()) return false
         val mixerCmd = profile.mixerIncallMusicCmd
         if (mixerCmd.isEmpty()) {
             Log.i(TAG, "Mixer: no incall_music commands for ${profile.name}")
@@ -1236,6 +1354,7 @@ class RtpSession(
             "($resolvedMixerCmd) && echo INCALL_MIXER_READY",
             timeoutMs = 1500,
         )
+        if (!running.get()) return false
         val msg = "Mixer critical: exit=${result.exitCode} timeout=${result.timedOut} " +
             "duration=${result.durationMs}ms output=${result.output.take(160)}"
         if (result.succeeded && result.output.contains("INCALL_MIXER_READY")) {
@@ -1251,23 +1370,25 @@ class RtpSession(
     private fun verifyIncallMusicMixerAsync() {
         val command = profile.mixerIncallMusicVerifyCmd
         if (command.isEmpty()) return
-        Thread({
+        startSessionThread("RTP-Mixer-Verify-$localPort") {
+            if (!running.get()) return@startSessionThread
             val resolved = DeviceProfile.resolveCmd(command)
-            if (resolved.isEmpty()) return@Thread
+            if (resolved.isEmpty()) return@startSessionThread
             val started = SystemClock.elapsedRealtime()
             val output = RootShell.execForOutput(resolved, timeoutMs = 3000)
+            if (!running.get()) return@startSessionThread
             val elapsed = SystemClock.elapsedRealtime() - started
             val msg = "Mixer post-connect verify: duration=${elapsed}ms output=${output.take(500)}"
             if (output.isBlank()) Log.w(TAG, msg) else Log.i(TAG, msg)
             listener?.onRtpStats(msg)
-        }, "RTP-Mixer-Verify-$localPort").start()
+        }
     }
 
     /**
      * Re-assert RECORD_AUDIO appops via root.  Android's AppOpsService
      * re-revokes this permission for background apps when the screen turns
-     * off, killing VOICE_CALL capture (rawCapRMS drops to ~6).  Called
-     * at 3s and then every 5s from timeoutLoop to keep capture alive.
+     * off, killing telephony capture. Called at 3s and then every 15s from
+     * timeoutLoop to keep capture alive without delaying 5s RTP statistics.
      *
      * CRITICAL: Must use --uid flag to set the UID-level mode.
      * `appops set <pkg>` sets the package mode, but AudioFlinger checks
@@ -1299,6 +1420,7 @@ class RtpSession(
                 "killall com.android.permissioncontroller 2>/dev/null; " +
                 "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
             )
+            if (!running.get()) return
             val elapsed = System.currentTimeMillis() - t0
             val allowed = result.contains("allow", ignoreCase = true)
             Log.i(TAG, "appops re-assert: [$result] ok=$allowed (${elapsed}ms)")
@@ -1315,6 +1437,7 @@ class RtpSession(
                 Log.d(TAG, "appops RECORD_AUDIO verified: allow")
             }
         } catch (e: Exception) {
+            if (!running.get()) return
             Log.w(TAG, "appops re-assert failed: ${e.message}")
         }
     }
@@ -1333,11 +1456,13 @@ class RtpSession(
             am?.let {
                 it.setParameters("${param}=false")
                 Thread.sleep(50)
+                if (!running.get()) return
                 it.setParameters("${param}=true")
                 GsmCallManager.enforceVolumes(it)
                 Log.i(TAG, "${param} re-toggled (3s safety), mode=${it.mode}")
             }
         } catch (e: Exception) {
+            if (!running.get()) return
             Log.w(TAG, "${param} re-toggle failed: ${e.message}")
         }
     }
@@ -1373,8 +1498,9 @@ class RtpSession(
             // Comprehensive ABOX routing dump via root
             val tinymix = DeviceProfile.tinymixBin
             if (tinymix.isNotEmpty()) {
-                Thread({
+                startSessionThread("RTP-Capture-Diag-$localPort") {
                     try {
+                        if (!running.get()) return@startSessionThread
                         // Phase 1: device-specific mixer routing state
                         val routingCmd = DeviceProfile.resolveCmd(profile.mixerDiagGrep)
                         val routing = RootShell.execForOutput(routingCmd, timeoutMs = 8000)
@@ -1495,9 +1621,9 @@ class RtpSession(
                             }
                         }
                     } catch (e: Exception) {
-                        Log.w(TAG, "Diag routing check failed: ${e.message}")
+                        if (running.get()) Log.w(TAG, "Diag routing check failed: ${e.message}")
                     }
-                }, "CaptureDiag").start()
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Capture diagnostics failed: ${e.message}")
@@ -1554,6 +1680,17 @@ class RtpSession(
 
     companion object {
         private const val TAG = "RtpSession"
+        private const val CAPTURE_INIT_ATTEMPTS = 3
+        private const val CAPTURE_RESTART_LIMIT = 3
+        private const val CAPTURE_RESTART_DELAY_MS = 500L
+        private const val CAPTURE_READ_STALL_TIMEOUT_MS = 2_000L
+        private const val CAPTURE_FRAME_TIMEOUT_MS = 5_000L
+        private const val LOW_LEVEL_RMS_THRESHOLD = 10
+        private const val LOW_LEVEL_LOG_FRAMES = 150
+        private const val LOW_LEVEL_PERIODIC_LOG_FRAMES = 1_500
+        private const val WORKER_JOIN_TIMEOUT_MS = 500L
+        private const val STATS_INTERVAL_MS = 5_000L
+        private const val APP_OPS_INTERVAL_MS = 15_000L
     }
 }
 

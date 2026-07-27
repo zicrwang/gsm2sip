@@ -115,10 +115,12 @@ object RootShell {
      */
     fun execCritical(cmd: String, timeoutMs: Long = 1500): Result {
         val started = android.os.SystemClock.elapsedRealtime()
+        var process: Process? = null
         return try {
             val proc = ProcessBuilder("su", "-c", cmd)
                 .redirectErrorStream(true)
                 .start()
+            process = proc
             val completed = proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
             if (!completed) {
                 proc.destroy()
@@ -138,6 +140,9 @@ object RootShell {
                 )
             }
         } catch (e: Exception) {
+            process?.destroy()
+            process?.let { if (it.isAlive) it.destroyForcibly() }
+            if (e is InterruptedException) Thread.currentThread().interrupt()
             Result(
                 exitCode = -1,
                 output = e.message.orEmpty(),

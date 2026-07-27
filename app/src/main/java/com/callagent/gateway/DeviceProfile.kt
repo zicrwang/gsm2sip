@@ -4,6 +4,32 @@ import android.media.AudioAttributes
 import android.os.Build
 import android.util.Log
 
+enum class CaptureSourceKind {
+    VOICE_DOWNLINK,
+    VOICE_CALL,
+    VOICE_RECOGNITION,
+    MIC,
+    VOICE_COMMUNICATION,
+}
+
+enum class CaptureSourcePolicy {
+    INITIAL_FALLBACK_ALLOWED,
+    VERIFIED_DOWNLINK_ONLY;
+
+    fun initialSources(preferTelephonyCapture: Boolean): List<CaptureSourceKind> = when (this) {
+        VERIFIED_DOWNLINK_ONLY -> listOf(CaptureSourceKind.VOICE_DOWNLINK)
+        INITIAL_FALLBACK_ALLOWED -> buildList {
+            if (preferTelephonyCapture) {
+                add(CaptureSourceKind.VOICE_DOWNLINK)
+                add(CaptureSourceKind.VOICE_CALL)
+            }
+            add(CaptureSourceKind.VOICE_RECOGNITION)
+            add(CaptureSourceKind.MIC)
+            add(CaptureSourceKind.VOICE_COMMUNICATION)
+        }
+    }
+}
+
 /**
  * Device-specific audio profile.  Each supported device has different
  * mixer controls, volume calibration, and audio HAL behavior.
@@ -72,6 +98,9 @@ data class DeviceProfile(
     /** Whether privileged telephony AudioRecord sources should be tried
      *  before acoustic microphone fallbacks. */
     val preferTelephonyCapture: Boolean = false,
+
+    /** Sources permitted while selecting a capture path for a call. */
+    val captureSourcePolicy: CaptureSourcePolicy = CaptureSourcePolicy.INITIAL_FALLBACK_ALLOWED,
 
     /** Apply the mixer setup before requesting the speaker route. */
     val setupMixerBeforeRoute: Boolean = false,
@@ -322,6 +351,7 @@ data class DeviceProfile(
             incallMusicParam = "incall_music_enabled",
             voiceDownlinkWorks = true,
             preferTelephonyCapture = true,
+            captureSourcePolicy = CaptureSourcePolicy.VERIFIED_DOWNLINK_ONLY,
             setupMixerBeforeRoute = true,
             voiceCallVolPercent = 1,
             routeChangeDelayMs = 500,

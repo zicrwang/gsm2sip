@@ -1,6 +1,6 @@
 # RTP 与媒体就绪
 
-本文描述 gsm2sip `2.8.70` 的 RTP 接收时间线，以及 SIP 接通前的媒体就绪边界。
+本文描述 gsm2sip `2.8.71` 的 RTP 接收时间线，以及 SIP 接通前的媒体就绪边界。
 
 ## 固定媒体格式
 
@@ -75,6 +75,23 @@ Asterisk dialplan 不保证跨两条呼叫腿复制任意自定义响应头，�
 
 干净局域网的目标是 `overflow=0`，`concealed` 与 `underrun` 接近 0，收发速率约
 为每秒 50 包。
+
+每 5 秒记录一次周期统计。通话停止时先终止 RTP 工作线程，再从会话计数器和
+抖动缓冲生成不可变快照，并输出一次带 `final=true` 的最终统计；停止流程不再
+清零抖动缓冲计数，也不会让休眠中的统计线程在挂断后继续执行 appops。
+
+## MI8 捕获源可靠性
+
+MI8 profile 固定使用已验证的数字 `VOICE_DOWNLINK`，不允许切换到可能包含蜂窝
+上行的 `VOICE_CALL`，也不允许切换到 `VOICE_RECOGNITION`、`MIC` 或
+`VOICE_COMMUNICATION` 等物理麦克风路径。连续低电平是合法的通话静音，只输出
+限频诊断并保持当前源。
+
+只有 `AudioRecord.startRecording()` 失败、录音状态错误或 `read()` 返回硬错误才
+执行同源恢复。同一个 `VOICE_DOWNLINK` 连续三次硬故障后记录
+`Capture fatal ... action=hangup`。若阻塞式 `read()` 连续 5 秒没有产生任何帧，
+独立看门线程会直接按不可恢复停滞挂断。`CallOrchestrator` 会核对当前 RTP 会话身份
+并同时结束 SIP 与 GSM 呼叫，不能以静音 RTP 无限维持半通话。
 
 ## 已实施：音频启动与抖动缓冲优化
 

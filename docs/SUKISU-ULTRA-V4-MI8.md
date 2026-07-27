@@ -50,8 +50,8 @@ export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=10808 -Dhttps.pr
 ```
 
 测试覆盖 RTP 扩展头/填充解析、乱序、重复包、丢包、序列号回绕、SSRC 切换和
-缓冲溢出和 RFC2833 PT=101 结束包去重。当前发布版本应为 `2.8.70`
-（versionCode `348`）。
+缓冲溢出和 RFC2833 PT=101 结束包去重。当前发布版本应为 `2.8.71`
+（versionCode `349`）。
 
 Release APK 必须经过签名。当前私有设备构建使用编译机上固定的 Android debug
 keystore，便于后续版本使用同一签名升级；该签名不适合公开发行。
@@ -101,7 +101,7 @@ v2.8.57 已验证选择 SIM 1 后 Telecom 直接进入 `DIALING`，不会再进�
 `SELECT_PHONE_ACCOUNT`。
 
 v2.8.58 在此基础上为 MI8 增加物理 Voice RX endpoint 静音，并保留
-VOICE_DOWNLINK/VOICE_CALL 数字捕获和 incall_music 数字注入；挂断后 mixer
+VOICE_DOWNLINK 数字捕获和 incall_music 数字注入；挂断后 mixer
 自动恢复。
 
 ## 4. 部署验收
@@ -150,9 +150,10 @@ adb -s 192.168.2.82:5555 shell \
 - 保留 MultiMedia1 到 incall_music 的数字支路，同时关闭
   `QUAT_MI2S_RX Audio Mixer MultiMedia1`，避免注入音频在 MI8 本机播放后
   再被任何残留麦克风声学回采
-- 优先尝试 `VOICE_DOWNLINK` 和 `VOICE_CALL` 数字通话录音源
-- 失败或静音时回退到 `VOICE_RECOGNITION`、`MIC` 和
-  `VOICE_COMMUNICATION`
+- 固定使用已验证的 `VOICE_DOWNLINK` 数字通话录音源
+- 正常静音只记录限频日志；禁止切换到 `VOICE_CALL`、
+  `VOICE_RECOGNITION`、`MIC` 或 `VOICE_COMMUNICATION`
+- AudioRecord 硬故障只重建同一数字源，连续三次失败后同时挂断 SIP 和 GSM
 - 使用 SDM845/Tavil 对应的 mixer 诊断，而不是 Samsung ABOX 控件
 
 最终仍需通过一次真实 GSM 与 SIP 双向通话验证上下行声音、增益和回声参数。

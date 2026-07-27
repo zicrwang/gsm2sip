@@ -17,7 +17,7 @@
 CallAgent 当前固定使用 PCMA（G.711 A-law，RTP payload type 8，8 kHz，
 每包 160 字节/20 ms）。这是有意的兼容性选择：部分 Android 模拟器或旧音频
 HAL 会声明支持宽带音频，但实际无法建立通话音频通道。接收端先经过按 RTP
-扩展序列号排序的 3 帧预缓冲和 5 帧有界队列，再进入设备所需的深缓冲
+扩展序列号排序的 3 帧初始目标、3 至 6 帧自适应目标和 12 帧有界队列，再进入设备所需的深缓冲
 `AudioTrack`；具体状态和指标见 [RTP 与媒体就绪](RTP-AND-MEDIA-READINESS.md)。
 
 Asterisk 的 `chan_sip` 账号建议配置为：
@@ -123,10 +123,11 @@ GSM dial timeout
 - SDP 是否只协商 `PCMA/8000`。
 - CallAgent 是否记录 `AudioRecord OK`、`AudioTrack` 启动和 RTP 收发计数增长。
 
-音频源由设备配置决定。Xiaomi MI8 (`dipper`) 会优先尝试 `VOICE_DOWNLINK`
-和 `VOICE_CALL`，再回退到普通麦克风源；未验证数字通话路径的设备仍优先使用
-普通音频输入。若实际顺序与设备配置不符，应先核对 APK 版本和 `DeviceProfile`
-日志。
+音频源由设备配置决定。Xiaomi MI8 (`dipper`) 固定使用已验证的数字
+`VOICE_DOWNLINK`，通话静音不会触发换源，也不会回退到 `VOICE_CALL` 或普通
+麦克风源。只有 AudioRecord 硬故障才会重建同一数字源，连续三次失败后主动挂断
+并记录 `Capture fatal ... action=hangup`。未验证数字路径的其他设备仍按各自
+profile 选择普通输入。
 
 ### `RTP ready` 但无声音
 
@@ -158,16 +159,16 @@ sha256sum gateway.apk gateway-magisk.zip
 
 ```text
 gateway.apk
-72fb66f8272e6f6b6fdc812c0dbe4ddba9835d55e28a6af4703a0a4f56fb18d5
+adb481b1fcaafe66b95730b541c0f5c61a44f5e1a846b162e8879bdf999fce06
 
 gateway-magisk.zip
-6005fefd8161b3ef1e12a4faaa80d3785f6233f2ef32b84314bc13eea1089090
+97ecb9ad490a8752fd3fbb6fb584de5b9d214e14cd9036b7aec6e67cedfe9080
 ```
 
-APK 版本应为 `2.8.70`（versionCode `348`），并通过 APK Signature Scheme
+APK 版本应为 `2.8.71`（versionCode `349`），并通过 APK Signature Scheme
 v2 验证。
 
-v2.8.69 的 MI8 profile 保留 VOICE_DOWNLINK/VOICE_CALL 数字录音与
+v2.8.71 的 MI8 profile 固定使用 VOICE_DOWNLINK 数字录音与
 incall_music 数字注入；桥接期间断开 `CDC_IF TX6/TX7/TX8` 物理麦克风前端，
 并关闭 MultiMedia1 到本机 QUAT 接收器/扬声器的渲染支路。`Voice Tx Mute`
 保持关闭，因此数字注入不会随全局蜂窝 TX 一起被静音。SIP 200 OK 前必须完成
@@ -177,7 +178,8 @@ GSM ACTIVE、RTP socket、播放线程和捕获帧
 有效的 PCMA A-law 静音并推进 RTP 序列号和时间戳。外拨媒体在 GSM 振铃阶段主动
 预热，ACTIVE 后的关键路径不再执行全量 mixer dump，耗时 root 诊断延后到 SIP
 接通之后；GSM/SIP 超时绑定通话代次，
-旧通话的计时器不会中断下一次快速重拨。
+旧通话的计时器不会中断下一次快速重拨。周期 RTP 统计每 5 秒输出，挂断时保留
+抖动缓冲累计值并输出唯一的 `final=true` 最终快照。
 
 ## 7. 仍需在设备端完成的事项
 

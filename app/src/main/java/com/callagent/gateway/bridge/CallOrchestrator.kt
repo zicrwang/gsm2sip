@@ -664,6 +664,9 @@ class CallOrchestrator(
                 Log.e(TAG, "RTP error: $error")
                 listener?.onError("RTP: $error")
             }
+            override fun onCaptureFatal(error: String) {
+                handleCaptureFatal(session, error)
+            }
             override fun onRtpTimeout() {
                 Log.w(TAG, "RTP timeout — no audio from Asterisk, tearing down")
                 tearDown("RTP timeout")
@@ -704,6 +707,17 @@ class CallOrchestrator(
     }
 
     // ── Teardown ────────────────────────────────────────
+
+    @Synchronized
+    private fun handleCaptureFatal(session: RtpSession, error: String) {
+        if (activeRtpSession !== session) {
+            Log.w(TAG, "Ignoring stale RTP capture failure: $error")
+            return
+        }
+        Log.e(TAG, "RTP capture unavailable, tearing down current bridge: $error")
+        listener?.onError("RTP capture unavailable: $error")
+        tearDown("RTP capture unavailable")
+    }
 
     @Synchronized
     private fun tearDown(reason: String) {
